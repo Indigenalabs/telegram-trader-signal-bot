@@ -31,6 +31,60 @@ Or on Windows PowerShell:
 .\run_bot.ps1
 ```
 
+## Hetzner Deploy
+
+Recommended target:
+- Ubuntu 24.04 VPS
+- 1 vCPU / 2 GB RAM is enough for this bot
+
+One-time server flow:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+sudo mkdir -p /opt
+cd /opt
+sudo git clone https://github.com/Indigenalabs/telegram-trader-signal-bot.git
+sudo bash /opt/telegram-trader-signal-bot/deploy/hetzner/setup.sh
+```
+
+Then create the environment file:
+
+```bash
+cd /opt/telegram-trader-signal-bot
+sudo cp .env.example .env
+sudo nano .env
+```
+
+At minimum set:
+- `TELEGRAM_BOT_TOKEN`
+- `ALLOWED_CHAT_IDS`
+- `NEWSAPI_KEY`
+- `BINANCE_API_KEY`
+
+Install the service:
+
+```bash
+sudo cp /opt/telegram-trader-signal-bot/deploy/hetzner/telegram-trader-signal-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable telegram-trader-signal-bot
+sudo systemctl start telegram-trader-signal-bot
+sudo systemctl status telegram-trader-signal-bot
+```
+
+Useful operations:
+
+```bash
+sudo journalctl -u telegram-trader-signal-bot -f
+sudo systemctl restart telegram-trader-signal-bot
+cd /opt/telegram-trader-signal-bot && sudo git pull
+sudo systemctl restart telegram-trader-signal-bot
+```
+
+Persistent learning data will live in:
+- `/opt/telegram-trader-signal-bot/data/trade_history.json`
+- `/opt/telegram-trader-signal-bot/data/learning_model.json`
+
 ## Commands
 
 - `/start`

@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram Trader Signal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=traderbot
+Group=traderbot
+WorkingDirectory=/opt/telegram-trader-signal-bot
+EnvironmentFile=/opt/telegram-trader-signal-bot/.env
+Environment=PYTHONPATH=/opt/telegram-trader-signal-bot/src
+ExecStart=/opt/telegram-trader-signal-bot/.venv/bin/python -m trader_signal_bot.app
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
