@@ -10,10 +10,16 @@ from trader_signal_bot.services.state import UserStateStore
 
 
 class SQLiteStateStore(UserStateStore):
-    def __init__(self, default_risk_per_trade: float, database_path: str) -> None:
+    def __init__(self, default_risk_per_trade: float, database_path: str, namespace: str = "default") -> None:
         super().__init__(default_risk_per_trade)
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.namespace = self._normalize_namespace(namespace)
+        self._profiles_table = "profiles" if self.namespace == "default" else f"{self.namespace}_profiles"
+        self._tracked_trades_table = (
+            "tracked_trades" if self.namespace == "default" else f"{self.namespace}_tracked_trades"
+        )
+        self._alerts_table = "alerts" if self.namespace == "default" else f"{self.namespace}_alerts"
         self._lock = Lock()
         self._conn = sqlite3.connect(self.database_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -21,12 +27,17 @@ class SQLiteStateStore(UserStateStore):
         self._load_profiles()
         self._load_tracked_trades()
 
+    @staticmethod
+    def _normalize_namespace(namespace: str) -> str:
+        normalized = "".join(ch if ch.isalnum() else "_" for ch in namespace.strip().lower())
+        return normalized or "default"
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
     def backend_name(self) -> str:
-        return "sqlite"
+        return f"sqlite:{self.namespace}"
 
     def persistence_enabled(self) -> bool:
         return True
@@ -34,8 +45,8 @@ class SQLiteStateStore(UserStateStore):
     def _ensure_schema(self) -> None:
         with self._lock:
             self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS profiles (
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._profiles_table} (
                     chat_id INTEGER PRIMARY KEY,
                     risk_per_trade REAL NOT NULL,
                     watchlist_json TEXT NOT NULL,
@@ -44,7 +55,7 @@ class SQLiteStateStore(UserStateStore):
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
-                CREATE TABLE IF NOT EXISTS tracked_trades (
+                CREATE TABLE IF NOT EXISTS {self._tracked_trades_table} (
                     chat_id INTEGER NOT NULL,
                     ticker TEXT NOT NULL,
                     trade_id TEXT NOT NULL,
@@ -64,7 +75,7 @@ class SQLiteStateStore(UserStateStore):
                     PRIMARY KEY (chat_id, ticker)
                 );
 
-                CREATE TABLE IF NOT EXISTS alerts (
+                CREATE TABLE IF NOT EXISTS {self._alerts_table} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     chat_id INTEGER NOT NULL,
@@ -81,7 +92,7 @@ class SQLiteStateStore(UserStateStore):
     def _load_profiles(self) -> None:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT chat_id, risk_per_trade, watchlist_json, portfolio_json, alert_mode FROM profiles"
+                f"SELECT chat_id, risk_per_trade, watchlist_json, portfolio_json, alert_mode FROM {self._profiles_table}"
             ).fetchall()
         for row in rows:
             profile = UserProfile(
@@ -99,11 +110,11 @@ class SQLiteStateStore(UserStateStore):
     def _load_tracked_trades(self) -> None:
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT chat_id, ticker, trade_id, asset_class, side, stage, entry_low, entry_high,
                        stop_loss, take_profit_1, take_profit_2, confidence, market_session,
                        signal_quality, scores_json, opened_at
-                FROM tracked_trades
+                FROM {self._tracked_trades_table}
                 """
             ).fetchall()
         for row in rows:
@@ -130,8 +141,8 @@ class SQLiteStateStore(UserStateStore):
     def _sync_profile(self, profile: UserProfile) -> None:
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO profiles (chat_id, risk_per_trade, watchlist_json, portfolio_json, alert_mode, updated_at)
+                f"""
+                INSERT INTO {self._profiles_table} (chat_id, risk_per_trade, watchlist_json, portfolio_json, alert_mode, updated_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     risk_per_trade=excluded.risk_per_trade,
@@ -162,8 +173,8 @@ class SQLiteStateStore(UserStateStore):
     def _sync_tracked_trade(self, trade: TrackedTrade) -> None:
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO tracked_trades (
+                f"""
+                INSERT INTO {self._tracked_trades_table} (
                     chat_id, ticker, trade_id, asset_class, side, stage, entry_low, entry_high,
                     stop_loss, take_profit_1, take_profit_2, confidence, market_session,
                     signal_quality, scores_json, opened_at
@@ -220,7 +231,7 @@ class SQLiteStateStore(UserStateStore):
         super().clear_tracked_trade(chat_id, ticker)
         with self._lock:
             self._conn.execute(
-                "DELETE FROM tracked_trades WHERE chat_id = ? AND ticker = ?",
+                f"DELETE FROM {self._tracked_trades_table} WHERE chat_id = ? AND ticker = ?",
                 (chat_id, ticker.upper()),
             )
             self._conn.commit()
@@ -263,8 +274,8 @@ class SQLiteStateStore(UserStateStore):
     def log_alert(self, chat_id: int, signal: Signal) -> None:
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO alerts (chat_id, ticker, side, confidence, market_session, signal_quality)
+                f"""
+                INSERT INTO {self._alerts_table} (chat_id, ticker, side, confidence, market_session, signal_quality)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (

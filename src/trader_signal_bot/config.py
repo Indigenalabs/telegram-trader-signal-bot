@@ -73,6 +73,8 @@ SCAN_PRESETS = {
 class Settings:
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     bot_name: str = os.getenv("BOT_NAME", "Ultimate Trader Signal Bot")
+    bot_namespace: str = os.getenv("BOT_NAMESPACE", "default").strip().lower() or "default"
+    learning_namespace: str = os.getenv("LEARNING_NAMESPACE", "").strip().lower()
     default_risk_per_trade: float = float(os.getenv("DEFAULT_RISK_PER_TRADE", "0.01"))
     gameplan_hour_utc: int = int(os.getenv("GAMEPLAN_HOUR_UTC", "8"))
     gameplan_minute_utc: int = int(os.getenv("GAMEPLAN_MINUTE_UTC", "0"))
@@ -104,6 +106,16 @@ class Settings:
     learning_data_dir: str = os.getenv("LEARNING_DATA_DIR", "data")
     learning_min_sample_size: int = int(os.getenv("LEARNING_MIN_SAMPLE_SIZE", "3"))
     learning_max_confidence_adjustment: int = int(os.getenv("LEARNING_MAX_CONFIDENCE_ADJUSTMENT", "8"))
+    edge_over_speed_mode: bool = os.getenv("EDGE_OVER_SPEED_MODE", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    signal_min_confluence: int = int(os.getenv("SIGNAL_MIN_CONFLUENCE", "3"))
+    high_quality_min_confluence: int = int(os.getenv("HIGH_QUALITY_MIN_CONFLUENCE", "4"))
+    edge_score_min_alert: int = int(os.getenv("EDGE_SCORE_MIN_ALERT", "60"))
+    edge_score_min_high_quality: int = int(os.getenv("EDGE_SCORE_MIN_HIGH_QUALITY", "72"))
     learning_block_negative_edges: bool = os.getenv("LEARNING_BLOCK_NEGATIVE_EDGES", "true").strip().lower() in {
         "1",
         "true",
@@ -118,6 +130,10 @@ class Settings:
     default_tickers: list[str] = field(
         default_factory=lambda: _csv_env("DEFAULT_TICKERS") or DEFAULT_TICKER_UNIVERSE.copy()
     )
+
+    def __post_init__(self) -> None:
+        if not self.learning_namespace:
+            self.learning_namespace = self.bot_namespace
 
     def require_token(self) -> None:
         if not self.telegram_bot_token:

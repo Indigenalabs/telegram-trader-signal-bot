@@ -31,13 +31,19 @@ def main() -> None:
     news_service = NewsService(api_key=settings.newsapi_key)
     learning_service = LearningService(
         data_dir=settings.learning_data_dir,
+        namespace=settings.learning_namespace,
         min_sample_size=settings.learning_min_sample_size,
         max_confidence_adjustment=settings.learning_max_confidence_adjustment,
         block_negative_edges=settings.learning_block_negative_edges,
         weak_edge_threshold=settings.learning_weak_edge_threshold,
         weak_edge_min_samples=settings.learning_weak_edge_min_samples,
     )
-    engine = SignalEngine(provider, news_service=news_service, learning_service=learning_service)
+    engine = SignalEngine(
+        provider,
+        settings=settings,
+        news_service=news_service,
+        learning_service=learning_service,
+    )
     macro_risk_service = MacroRiskService(news_service)
     state: UserStateStore
     if settings.google_sheets_enabled:
@@ -53,6 +59,7 @@ def main() -> None:
                 state = SQLiteStateStore(
                     default_risk_per_trade=settings.default_risk_per_trade,
                     database_path=settings.sqlite_state_path,
+                    namespace=settings.bot_namespace,
                 )
             else:
                 state = UserStateStore(default_risk_per_trade=settings.default_risk_per_trade)
@@ -60,6 +67,7 @@ def main() -> None:
         state = SQLiteStateStore(
             default_risk_per_trade=settings.default_risk_per_trade,
             database_path=settings.sqlite_state_path,
+            namespace=settings.bot_namespace,
         )
     else:
         state = UserStateStore(default_risk_per_trade=settings.default_risk_per_trade)

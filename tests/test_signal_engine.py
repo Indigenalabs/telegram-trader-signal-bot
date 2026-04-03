@@ -31,6 +31,8 @@ class AnalysisTests(unittest.TestCase):
         current_price: float = 100.0,
         confidence: int = 67,
         quality: str = "high",
+        confluence_count: int = 4,
+        edge_score: int = 78,
     ) -> Signal:
         return Signal(
             ticker=ticker,
@@ -51,6 +53,8 @@ class AnalysisTests(unittest.TestCase):
             pricing_currency="USD",
             market_session="24/7 crypto market",
             signal_quality=quality,
+            confluence_count=confluence_count,
+            edge_score=edge_score,
         )
 
     def test_binance_symbol_mapping(self) -> None:
@@ -107,13 +111,20 @@ class AnalysisTests(unittest.TestCase):
         settings = Settings()
         strong_signal = self._sample_signal(confidence=69, quality="high")
         arming_signal = self._sample_signal(confidence=60, quality="tradable")
-        weak_signal = self._sample_signal(confidence=54, quality="watchlist")
+        weak_signal = self._sample_signal(confidence=54, quality="watchlist", edge_score=54, confluence_count=2)
 
         self.assertTrue(_is_actionable_signal(strong_signal, settings))
         self.assertTrue(_is_strong_signal(strong_signal, settings))
         self.assertTrue(_is_actionable_signal(arming_signal, settings))
         self.assertFalse(_is_strong_signal(arming_signal, settings))
         self.assertFalse(_is_actionable_signal(weak_signal, settings))
+
+    def test_edge_mode_requires_confluence_and_edge_score(self) -> None:
+        settings = Settings()
+        low_edge = self._sample_signal(confidence=67, quality="tradable", confluence_count=4, edge_score=58)
+        low_confluence = self._sample_signal(confidence=67, quality="tradable", confluence_count=2, edge_score=76)
+        self.assertFalse(_is_actionable_signal(low_edge, settings))
+        self.assertFalse(_is_actionable_signal(low_confluence, settings))
 
     def test_trade_close_outcome_hits_take_profit_for_long(self) -> None:
         trade = _build_tracked_trade(1, self._sample_signal(), TradeStage.SIGNAL)
@@ -153,6 +164,8 @@ class AnalysisTests(unittest.TestCase):
             self.assertGreater(adjusted.confidence, 62)
             self.assertGreaterEqual(adjusted.learning_adjustment, 1)
             self.assertTrue(adjusted.learning_notes)
+            self.assertGreater(adjusted.learned_expectancy, 0.0)
+            self.assertGreaterEqual(adjusted.learned_sample_size, 3)
 
     def test_learning_service_summary_reports_closed_trade_stats(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -236,9 +249,26 @@ class AnalysisTests(unittest.TestCase):
             loaded_trade = reopened.get_tracked_trade(7, "BTC-USD")
             self.assertIsNotNone(loaded_trade)
             self.assertEqual(loaded_trade.trade_id, trade.trade_id)
-            self.assertEqual(reopened.backend_name(), "sqlite")
+            self.assertEqual(reopened.backend_name(), "sqlite:default")
             self.assertTrue(reopened.persistence_enabled())
             reopened.close()
+
+    def test_sqlite_state_store_can_share_one_db_across_namespaces(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/shared_state.db"
+            alpha = SQLiteStateStore(default_risk_per_trade=0.01, database_path=db_path, namespace="alpha-bot")
+            beta = SQLiteStateStore(default_risk_per_trade=0.01, database_path=db_path, namespace="beta-bot")
+
+            alpha.set_watchlist(9, ["BTC-USD"])
+            beta.set_watchlist(9, ["AAPL"])
+
+            self.assertEqual(alpha.get_profile(9).watchlist, ["BTC-USD"])
+            self.assertEqual(beta.get_profile(9).watchlist, ["AAPL"])
+            self.assertEqual(alpha.backend_name(), "sqlite:alpha_bot")
+            self.assertEqual(beta.backend_name(), "sqlite:beta_bot")
+
+            alpha.close()
+            beta.close()
 
     def test_scan_presets_include_metals_and_energy(self) -> None:
         self.assertIn("GC=F", SCAN_PRESETS["metals"])

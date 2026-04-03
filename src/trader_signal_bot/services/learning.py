@@ -13,6 +13,7 @@ class LearningService:
     def __init__(
         self,
         data_dir: str,
+        namespace: str = "default",
         min_sample_size: int = 3,
         max_confidence_adjustment: int = 8,
         block_negative_edges: bool = True,
@@ -21,8 +22,11 @@ class LearningService:
     ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.history_path = self.data_dir / "trade_history.json"
-        self.model_path = self.data_dir / "learning_model.json"
+        self.namespace = namespace.strip().lower() or "default"
+        history_name = "trade_history.json" if self.namespace == "default" else f"{self.namespace}_trade_history.json"
+        model_name = "learning_model.json" if self.namespace == "default" else f"{self.namespace}_learning_model.json"
+        self.history_path = self.data_dir / history_name
+        self.model_path = self.data_dir / model_name
         self.min_sample_size = max(2, min_sample_size)
         self.max_confidence_adjustment = max(2, max_confidence_adjustment)
         self.block_negative_edges = block_negative_edges
@@ -173,6 +177,10 @@ class LearningService:
         self._save_model()
 
     def adjustment_for_signal(self, signal: Signal) -> tuple[int, list[str]]:
+        edge = self.edge_context_for_signal(signal)
+        return int(edge["adjustment"]), list(edge["notes"])
+
+    def edge_context_for_signal(self, signal: Signal) -> dict[str, Any]:
         keys = self._bucket_key(
             asset_class=signal.asset_class.value,
             market_session=signal.market_session,
@@ -180,6 +188,10 @@ class LearningService:
             side=signal.side.value,
         )
         weighted_adjustment = 0.0
+        weighted_expectancy = 0.0
+        weighted_win_rate = 0.0
+        weighted_avg_r = 0.0
+        weighted_samples = 0.0
         total_weight = 0.0
         notes: list[str] = []
         weights = {
@@ -194,27 +206,53 @@ class LearningService:
                 continue
             weight = weights[bucket_name]
             weighted_adjustment += float(payload.get("adjustment", 0)) * weight
+            weighted_expectancy += float(payload.get("expectancy", 0.0)) * weight
+            weighted_win_rate += float(payload.get("win_rate", 0.0)) * weight
+            weighted_avg_r += float(payload.get("avg_r", 0.0)) * weight
+            weighted_samples += float(payload.get("samples", 0)) * weight
             total_weight += weight
             notes.append(
                 f"{bucket_name.replace('_', ' ')} learned edge: {int(payload.get('adjustment', 0)):+d} from {int(payload.get('samples', 0))} samples"
             )
         if total_weight == 0:
-            return 0, []
+            return {
+                "adjustment": 0,
+                "notes": [],
+                "expectancy": 0.0,
+                "win_rate": 0.0,
+                "avg_r": 0.0,
+                "samples": 0,
+            }
         adjustment = round(weighted_adjustment / total_weight)
         adjustment = max(-self.max_confidence_adjustment, min(self.max_confidence_adjustment, adjustment))
-        return int(adjustment), notes[:2]
+        return {
+            "adjustment": int(adjustment),
+            "notes": notes[:2],
+            "expectancy": round(weighted_expectancy / total_weight, 2),
+            "win_rate": round(weighted_win_rate / total_weight, 2),
+            "avg_r": round(weighted_avg_r / total_weight, 2),
+            "samples": max(self.min_sample_size, round(weighted_samples / total_weight)),
+        }
 
     def apply_to_signal(self, signal: Signal) -> Signal:
         if signal.side == SignalSide.NEUTRAL:
             signal.base_confidence = signal.confidence
             signal.learning_adjustment = 0
             signal.learning_notes = []
+            signal.learned_expectancy = 0.0
+            signal.learned_win_rate = 0.0
+            signal.learned_sample_size = 0
             return signal
-        adjustment, notes = self.adjustment_for_signal(signal)
+        edge = self.edge_context_for_signal(signal)
+        adjustment = int(edge["adjustment"])
+        notes = list(edge["notes"])
         signal.base_confidence = signal.confidence
         signal.learning_adjustment = adjustment
         signal.confidence = max(0, min(100, signal.confidence + adjustment))
         signal.learning_notes = notes
+        signal.learned_expectancy = float(edge["expectancy"])
+        signal.learned_win_rate = float(edge["win_rate"])
+        signal.learned_sample_size = int(edge["samples"])
         if signal.side != SignalSide.NEUTRAL:
             if signal.confidence >= 68:
                 signal.signal_quality = "high"

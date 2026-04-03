@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from trader_signal_bot.config import Settings
 from trader_signal_bot.domain import (
     Gameplan,
     PortfolioRiskReport,
@@ -28,10 +29,12 @@ class SignalEngine:
     def __init__(
         self,
         provider: MarketDataProvider,
+        settings: Settings,
         news_service: NewsService | None = None,
         learning_service: LearningService | None = None,
     ) -> None:
         self.provider = provider
+        self.settings = settings
         self.news_service = news_service or NewsService()
         self.learning_service = learning_service
         self.weights = {
@@ -41,6 +44,91 @@ class SignalEngine:
             "risk": 0.15,
             "macro": 0.10,
         }
+
+    def _confluence_for_side(
+        self,
+        side: SignalSide,
+        analyses: dict[str, object],
+        min_technical: int,
+        min_risk: int,
+    ) -> tuple[int, list[str]]:
+        thresholds_long = {
+            "technical": min_technical,
+            "fundamental": 52,
+            "sentiment": 52,
+            "risk": min_risk,
+            "macro": 50,
+        }
+        thresholds_short = {
+            "technical": 100 - min_technical,
+            "fundamental": 48,
+            "sentiment": 48,
+            "risk": max(45, min_risk - 5),
+            "macro": 45,
+        }
+        if side == SignalSide.LONG:
+            checks = {
+                "technical": (
+                    analyses["technical"].score >= thresholds_long["technical"],
+                    "Trend stack is aligned with the long side.",
+                ),
+                "fundamental": (
+                    analyses["fundamental"].score >= thresholds_long["fundamental"],
+                    "Underlying structure is supportive enough to hold a long bias.",
+                ),
+                "sentiment": (
+                    analyses["sentiment"].score >= thresholds_long["sentiment"],
+                    "Sentiment is leaning constructive instead of fighting the move.",
+                ),
+                "risk": (
+                    analyses["risk"].score >= thresholds_long["risk"],
+                    "Risk conditions are controlled enough for structured exposure.",
+                ),
+                "macro": (
+                    analyses["macro"].score >= thresholds_long["macro"],
+                    "Macro backdrop is not materially working against the setup.",
+                ),
+            }
+        else:
+            checks = {
+                "technical": (
+                    analyses["technical"].score <= thresholds_short["technical"],
+                    "Trend structure is weak enough to justify a short bias.",
+                ),
+                "fundamental": (
+                    analyses["fundamental"].score <= thresholds_short["fundamental"],
+                    "Underlying structure is soft enough to support downside pressure.",
+                ),
+                "sentiment": (
+                    analyses["sentiment"].score <= thresholds_short["sentiment"],
+                    "Sentiment is stretched or deteriorating into the short side.",
+                ),
+                "risk": (
+                    analyses["risk"].score >= thresholds_short["risk"],
+                    "Risk conditions are orderly enough to define a short cleanly.",
+                ),
+                "macro": (
+                    analyses["macro"].score >= thresholds_short["macro"],
+                    "Macro backdrop leaves room for downside continuation.",
+                ),
+            }
+
+        confluence_signals = [reason for passed, reason in checks.values() if passed]
+        return len(confluence_signals), confluence_signals
+
+    def _edge_score(self, signal: Signal) -> int:
+        confluence_pct = min(100.0, (signal.confluence_count / 5) * 100)
+        expectancy_boost = max(-8.0, min(12.0, signal.learned_expectancy * 10))
+        win_rate_boost = max(-6.0, min(10.0, (signal.learned_win_rate - 50.0) * 0.22))
+        support_boost = min(8.0, signal.learned_sample_size * 0.6)
+        raw = (
+            signal.confidence * 0.52
+            + confluence_pct * 0.28
+            + expectancy_boost
+            + win_rate_boost
+            + support_boost
+        )
+        return max(0, min(100, round(raw)))
 
     def analyze(self, ticker: str) -> tuple[PriceSnapshot, dict[str, object]]:
         snapshot = self.provider.get_snapshot(ticker)
@@ -138,12 +226,16 @@ class SignalEngine:
 
         confidence = round((weighted_score * 0.7) + (risk_score * 0.3))
         base_confidence = max(0, min(confidence, 100))
-        if confidence >= 68 and side != SignalSide.NEUTRAL:
-            signal_quality = "high"
-        elif confidence >= 58 and side != SignalSide.NEUTRAL:
-            signal_quality = "tradable"
-        else:
-            signal_quality = "watchlist"
+        confluence_count = 0
+        confluence_signals: list[str] = []
+        if side != SignalSide.NEUTRAL:
+            confluence_count, confluence_signals = self._confluence_for_side(
+                side,
+                analyses,
+                min_technical=min_technical,
+                min_risk=min_risk,
+            )
+        signal_quality = "watchlist"
 
         if snapshot.asset_class.value in {"stock", "etf"}:
             timeframe = "2-7 days"
@@ -169,6 +261,8 @@ class SignalEngine:
             rationale=rationale,
             scores={name: round(score.score, 2) for name, score in analyses.items()},
             base_confidence=base_confidence,
+            confluence_count=confluence_count,
+            confluence_signals=confluence_signals,
             price_source=str(snapshot.meta.get("price_source", snapshot.meta.get("exchange", ""))),
             pricing_symbol=str(snapshot.meta.get("pricing_symbol", snapshot.ticker)),
             pricing_currency=snapshot.currency,
@@ -177,6 +271,38 @@ class SignalEngine:
         )
         if self.learning_service is not None:
             signal = self.learning_service.apply_to_signal(signal)
+        signal.edge_score = self._edge_score(signal)
+
+        if side != SignalSide.NEUTRAL and self.settings.edge_over_speed_mode:
+            if (
+                signal.confluence_count < self.settings.signal_min_confluence
+                or signal.edge_score < self.settings.edge_score_min_alert
+            ):
+                signal.side = SignalSide.NEUTRAL
+                signal.signal_quality = "watchlist"
+                signal.learning_adjustment = 0
+                signal.edge_score = max(0, min(signal.edge_score, self.settings.edge_score_min_alert - 1))
+                signal.rationale.insert(
+                    0,
+                    "Edge filter is standing down here because confluence and historical support are not strong enough yet.",
+                )
+            elif (
+                signal.confidence >= self.settings.strong_play_min_confidence
+                and signal.confluence_count >= self.settings.high_quality_min_confluence
+                and signal.edge_score >= self.settings.edge_score_min_high_quality
+            ):
+                signal.signal_quality = "high"
+            elif signal.confidence >= self.settings.live_alert_min_confidence:
+                signal.signal_quality = "tradable"
+            else:
+                signal.signal_quality = "watchlist"
+        elif side != SignalSide.NEUTRAL:
+            if signal.confidence >= 68:
+                signal.signal_quality = "high"
+            elif signal.confidence >= 58:
+                signal.signal_quality = "tradable"
+            else:
+                signal.signal_quality = "watchlist"
         return signal
 
     def get_news_brief(self, ticker: str, page_size: int = 5) -> list[dict[str, str]]:
@@ -191,7 +317,11 @@ class SignalEngine:
             except Exception:
                 continue
 
-        ranked = sorted(signals, key=lambda item: item.confidence, reverse=True)[:5]
+        ranked = sorted(
+            signals,
+            key=lambda item: (item.edge_score, item.confidence, item.confluence_count),
+            reverse=True,
+        )[:5]
         avg_confidence = round(sum(item.confidence for item in ranked) / len(ranked)) if ranked else 50
         entropy_score = max(15, min(90, 100 - avg_confidence))
         superposition_risk = min(95, 30 + (len([item for item in ranked if item.side != SignalSide.NEUTRAL]) * 10))

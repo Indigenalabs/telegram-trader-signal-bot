@@ -94,6 +94,15 @@ That database stores:
 - alert mode
 - tracked live trade lifecycle state
 
+For multi-bot setups:
+- use a unique `BOT_NAMESPACE` per bot if they share the same SQLite file
+- use the same `LEARNING_NAMESPACE` only when you explicitly want multiple bots to learn from one shared outcome pool
+
+Edge-over-speed mode is enabled by default. It makes the bot more selective by requiring:
+- minimum signal confluence across the analysis modules
+- a minimum edge score before alerts are allowed
+- higher confluence plus higher edge score for high-quality push alerts
+
 ## Commands
 
 - `/start`

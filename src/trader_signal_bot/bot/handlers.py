@@ -46,7 +46,13 @@ def _authorized(settings: Settings, chat_id: int) -> bool:
 
 def _signal_text(signal: Signal) -> str:
     learning_line = (
-        f"Learning: base {signal.base_confidence}% | adjustment {signal.learning_adjustment:+d}\n"
+        f"Learning: base {signal.base_confidence}% | adjustment {signal.learning_adjustment:+d} | "
+        f"expectancy {signal.learned_expectancy:+.2f}R | support {signal.learned_sample_size}\n"
+        if signal.side != SignalSide.NEUTRAL
+        else ""
+    )
+    edge_line = (
+        f"Edge: {signal.edge_score}/100 | confluence {signal.confluence_count}/5\n"
         if signal.side != SignalSide.NEUTRAL
         else ""
     )
@@ -62,6 +68,7 @@ def _signal_text(signal: Signal) -> str:
         f"TP1: {signal.take_profit_1}\n"
         f"TP2: {signal.take_profit_2}\n"
         f"Confidence: {signal.confidence}%\n"
+        f"{edge_line}"
         f"{learning_line}"
         f"Timeframe: {signal.timeframe}\n"
         f"Rationale:\n- " + "\n- ".join(signal.rationale[:4]) + "\n\n"
@@ -71,7 +78,14 @@ def _signal_text(signal: Signal) -> str:
 
 
 def _is_actionable_signal(signal: Signal, settings: Settings) -> bool:
-    return signal.side != SignalSide.NEUTRAL and signal.confidence >= settings.live_alert_min_confidence
+    if signal.side == SignalSide.NEUTRAL or signal.confidence < settings.live_alert_min_confidence:
+        return False
+    if settings.edge_over_speed_mode:
+        if signal.confluence_count < settings.signal_min_confluence:
+            return False
+        if signal.edge_score < settings.edge_score_min_alert:
+            return False
+    return True
 
 
 def _is_strong_signal(signal: Signal, settings: Settings) -> bool:
@@ -79,6 +93,11 @@ def _is_strong_signal(signal: Signal, settings: Settings) -> bool:
         return False
     if signal.confidence < settings.strong_play_min_confidence:
         return False
+    if settings.edge_over_speed_mode:
+        if signal.confluence_count < settings.high_quality_min_confluence:
+            return False
+        if signal.edge_score < settings.edge_score_min_high_quality:
+            return False
     if settings.live_alert_high_quality_only and signal.signal_quality != "high":
         return False
     return True
@@ -235,7 +254,8 @@ def _scan_text(signals: list[Signal], source_label: str) -> str:
         return f"📡 <b>Scan</b> - {source_label}\nNo valid signals returned."
 
     lines = [
-        f"- <b>{signal.ticker}</b>: {signal.side.value} | {signal.confidence}% | {signal.signal_quality} | {signal.market_session}"
+        f"- <b>{signal.ticker}</b>: {signal.side.value} | conf {signal.confidence}% | edge {signal.edge_score} | "
+        f"confluence {signal.confluence_count}/5 | {signal.signal_quality} | {signal.market_session}"
         for signal in signals
     ]
     return f"📡 <b>Scan</b> - {source_label}\n" + "\n".join(lines)
@@ -360,7 +380,11 @@ def build_handlers(
                 signals.append(engine.generate_signal(ticker))
             except Exception:
                 continue
-        ranked = sorted(signals, key=lambda item: item.confidence, reverse=True)[:10]
+        ranked = sorted(
+            signals,
+            key=lambda item: (item.edge_score, item.confidence, item.confluence_count),
+            reverse=True,
+        )[:10]
         guarded_reply(update, _scan_text(ranked, source_label))
 
     def news(update: Update, context: CallbackContext) -> None:
@@ -467,7 +491,9 @@ def build_handlers(
             f"Default risk per trade: {settings.default_risk_per_trade:.2%}\n"
             f"Daily gameplan: {settings.gameplan_hour_utc:02d}:{settings.gameplan_minute_utc:02d} UTC\n"
             f"Live alerts: {'on' if settings.live_alerts_enabled else 'off'} every {settings.live_alert_interval_minutes}m, min confidence {settings.live_alert_min_confidence}, strong plays {settings.strong_play_min_confidence}\n"
+            f"Edge mode: {'on' if settings.edge_over_speed_mode else 'off'} | min confluence {settings.signal_min_confluence} | high confluence {settings.high_quality_min_confluence} | edge floor {settings.edge_score_min_alert}/{settings.edge_score_min_high_quality}\n"
             f"Learning data: {settings.learning_data_dir} | min samples {settings.learning_min_sample_size} | max adjustment {settings.learning_max_confidence_adjustment}\n"
+            f"Namespaces: bot {settings.bot_namespace} | learning {settings.learning_namespace}\n"
             f"Weak edge filter: {'on' if settings.learning_block_negative_edges else 'off'} | threshold {settings.learning_weak_edge_threshold} | min samples {settings.learning_weak_edge_min_samples}\n"
             f"Twelve Data: {'configured' if settings.twelvedata_api_key else 'fallback to Yahoo'}\n"
             f"State backend: {state.backend_name()} ({'persistent' if state.persistence_enabled() else 'ephemeral'})\n"

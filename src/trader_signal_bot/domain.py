@@ -69,6 +69,12 @@ class Signal:
     base_confidence: int = 0
     learning_adjustment: int = 0
     learning_notes: list[str] = field(default_factory=list)
+    confluence_count: int = 0
+    confluence_signals: list[str] = field(default_factory=list)
+    edge_score: int = 0
+    learned_expectancy: float = 0.0
+    learned_win_rate: float = 0.0
+    learned_sample_size: int = 0
     price_source: str = ""
     pricing_symbol: str = ""
     pricing_currency: str = ""
