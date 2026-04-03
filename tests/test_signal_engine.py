@@ -18,6 +18,7 @@ from trader_signal_bot.services.learning import LearningService
 from trader_signal_bot.services.market_data import _to_binance_symbol
 from trader_signal_bot.services.news import NewsService, ticker_to_query
 from trader_signal_bot.services.registry import get_instrument_profile
+from trader_signal_bot.services.sqlite_state import SQLiteStateStore
 from trader_signal_bot.services.state import UserStateStore
 
 
@@ -215,6 +216,29 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(dashboard["ticker"], "ETH-USD")
             self.assertEqual(dashboard["summary"]["total_trades"], 2)
             self.assertTrue(dashboard["recent_closures"])
+
+    def test_sqlite_state_store_persists_profiles_and_tracked_trades(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/bot_state.db"
+            store = SQLiteStateStore(default_risk_per_trade=0.01, database_path=db_path)
+            store.set_watchlist(7, ["BTC-USD", "ETH-USD"])
+            store.add_portfolio_position(7, "BTC-USD", 42000, 0.25)
+            store.set_alert_mode(7, "all")
+            trade = _build_tracked_trade(7, self._sample_signal(), TradeStage.SIGNAL)
+            store.set_tracked_trade(trade)
+            store.close()
+
+            reopened = SQLiteStateStore(default_risk_per_trade=0.01, database_path=db_path)
+            profile = reopened.get_profile(7)
+            self.assertEqual(profile.watchlist, ["BTC-USD", "ETH-USD"])
+            self.assertEqual(profile.alert_mode, "all")
+            self.assertEqual(len(profile.portfolio), 1)
+            loaded_trade = reopened.get_tracked_trade(7, "BTC-USD")
+            self.assertIsNotNone(loaded_trade)
+            self.assertEqual(loaded_trade.trade_id, trade.trade_id)
+            self.assertEqual(reopened.backend_name(), "sqlite")
+            self.assertTrue(reopened.persistence_enabled())
+            reopened.close()
 
     def test_scan_presets_include_metals_and_energy(self) -> None:
         self.assertIn("GC=F", SCAN_PRESETS["metals"])

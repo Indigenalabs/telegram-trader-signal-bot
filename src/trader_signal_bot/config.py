@@ -94,6 +94,13 @@ class Settings:
     twelvedata_api_key: str = os.getenv("TWELVEDATA_API_KEY", "")
     google_service_account_json_path: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "")
     google_sheets_spreadsheet_id: str = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+    sqlite_state_enabled: bool = os.getenv("SQLITE_STATE_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    sqlite_state_path: str = os.getenv("SQLITE_STATE_PATH", "data/bot_state.db")
     learning_data_dir: str = os.getenv("LEARNING_DATA_DIR", "data")
     learning_min_sample_size: int = int(os.getenv("LEARNING_MIN_SAMPLE_SIZE", "3"))
     learning_max_confidence_adjustment: int = int(os.getenv("LEARNING_MAX_CONFIDENCE_ADJUSTMENT", "8"))

@@ -15,6 +15,7 @@ from trader_signal_bot.services.market_data import (
 )
 from trader_signal_bot.services.news import NewsService
 from trader_signal_bot.services.signal_engine import SignalEngine
+from trader_signal_bot.services.sqlite_state import SQLiteStateStore
 from trader_signal_bot.services.state import UserStateStore
 
 
@@ -47,8 +48,19 @@ def main() -> None:
                 spreadsheet_id=settings.google_sheets_spreadsheet_id,
             )
         except Exception as exc:
-            print(f"Google Sheets state unavailable, falling back to memory store: {exc}")
-            state = UserStateStore(default_risk_per_trade=settings.default_risk_per_trade)
+            print(f"Google Sheets state unavailable, falling back to local state store: {exc}")
+            if settings.sqlite_state_enabled:
+                state = SQLiteStateStore(
+                    default_risk_per_trade=settings.default_risk_per_trade,
+                    database_path=settings.sqlite_state_path,
+                )
+            else:
+                state = UserStateStore(default_risk_per_trade=settings.default_risk_per_trade)
+    elif settings.sqlite_state_enabled:
+        state = SQLiteStateStore(
+            default_risk_per_trade=settings.default_risk_per_trade,
+            database_path=settings.sqlite_state_path,
+        )
     else:
         state = UserStateStore(default_risk_per_trade=settings.default_risk_per_trade)
 

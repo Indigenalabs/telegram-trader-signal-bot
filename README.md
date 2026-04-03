@@ -85,6 +85,15 @@ Persistent learning data will live in:
 - `/opt/telegram-trader-signal-bot/data/trade_history.json`
 - `/opt/telegram-trader-signal-bot/data/learning_model.json`
 
+Persistent bot state now defaults to SQLite:
+- `/opt/telegram-trader-signal-bot/data/bot_state.db`
+
+That database stores:
+- watchlists
+- portfolios
+- alert mode
+- tracked live trade lifecycle state
+
 ## Commands
 
 - `/start`
