@@ -1,0 +1,767 @@
+from __future__ import annotations
+
+from datetime import datetime, time, timezone
+from uuid import uuid4
+
+from telegram import ParseMode, Update
+from telegram.ext import CallbackContext, CommandHandler, Updater
+
+from trader_signal_bot.config import SCAN_PRESETS, Settings
+from trader_signal_bot.domain import (
+    AssetClass,
+    Gameplan,
+    Signal,
+    SignalSide,
+    TrackedTrade,
+    TradeStage,
+)
+from trader_signal_bot.services.learning import LearningService
+from trader_signal_bot.services.macro_risk import MacroRiskService
+from trader_signal_bot.services.signal_engine import SignalEngine
+from trader_signal_bot.services.state import UserStateStore
+
+
+def _parse_tickers(args: list[str]) -> list[str]:
+    tickers: list[str] = []
+    for raw in args:
+        for item in raw.split(","):
+            normalized = item.strip().upper()
+            if normalized:
+                tickers.append(normalized)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for ticker in tickers:
+        if ticker not in seen:
+            seen.add(ticker)
+            deduped.append(ticker)
+    return deduped
+
+
+def _authorized(settings: Settings, chat_id: int) -> bool:
+    if not settings.allowed_chat_ids:
+        return True
+    return chat_id in settings.allowed_chat_ids
+
+
+def _signal_text(signal: Signal) -> str:
+    learning_line = (
+        f"Learning: base {signal.base_confidence}% | adjustment {signal.learning_adjustment:+d}\n"
+        if signal.side != SignalSide.NEUTRAL
+        else ""
+    )
+    return (
+        f"📈 <b>{signal.side.value}</b> - {signal.ticker}\n"
+        f"Asset: {signal.asset_class.value}\n"
+        f"Quality: {signal.signal_quality}\n"
+        f"Session: {signal.market_session}\n"
+        f"Market: {signal.price_source} {signal.pricing_symbol} ({signal.pricing_currency})\n"
+        f"Price now: {signal.current_price}\n"
+        f"Entry: {signal.entry_low} to {signal.entry_high}\n"
+        f"Stop: {signal.stop_loss}\n"
+        f"TP1: {signal.take_profit_1}\n"
+        f"TP2: {signal.take_profit_2}\n"
+        f"Confidence: {signal.confidence}%\n"
+        f"{learning_line}"
+        f"Timeframe: {signal.timeframe}\n"
+        f"Rationale:\n- " + "\n- ".join(signal.rationale[:4]) + "\n\n"
+        f"Scores: {signal.scores}\n"
+        f"<i>{signal.disclaimer}</i>"
+    )
+
+
+def _is_actionable_signal(signal: Signal, settings: Settings) -> bool:
+    return signal.side != SignalSide.NEUTRAL and signal.confidence >= settings.live_alert_min_confidence
+
+
+def _is_strong_signal(signal: Signal, settings: Settings) -> bool:
+    if not _is_actionable_signal(signal, settings):
+        return False
+    if signal.confidence < settings.strong_play_min_confidence:
+        return False
+    if settings.live_alert_high_quality_only and signal.signal_quality != "high":
+        return False
+    return True
+
+
+def _build_tracked_trade(
+    chat_id: int,
+    signal: Signal,
+    stage: TradeStage,
+    trade_id: str | None = None,
+) -> TrackedTrade:
+    return TrackedTrade(
+        trade_id=trade_id or str(uuid4()),
+        chat_id=chat_id,
+        ticker=signal.ticker,
+        asset_class=signal.asset_class,
+        side=signal.side,
+        stage=stage,
+        entry_low=signal.entry_low,
+        entry_high=signal.entry_high,
+        stop_loss=signal.stop_loss,
+        take_profit_1=signal.take_profit_1,
+        take_profit_2=signal.take_profit_2,
+        confidence=signal.confidence,
+        market_session=signal.market_session,
+        signal_quality=signal.signal_quality,
+        scores=signal.scores.copy(),
+        opened_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _trade_close_outcome(trade: TrackedTrade, signal: Signal) -> tuple[TradeStage | None, str]:
+    price = signal.current_price
+    if trade.side == SignalSide.LONG:
+        if price <= trade.stop_loss:
+            return TradeStage.CLOSED_FAILURE, f"Stop loss hit at {price}."
+        if price >= trade.take_profit_2:
+            return TradeStage.CLOSED_SUCCESS, f"Take profit 2 hit at {price}."
+        if price >= trade.take_profit_1:
+            return TradeStage.CLOSED_SUCCESS, f"Take profit 1 hit at {price}."
+    elif trade.side == SignalSide.SHORT:
+        if price >= trade.stop_loss:
+            return TradeStage.CLOSED_FAILURE, f"Stop loss hit at {price}."
+        if price <= trade.take_profit_2:
+            return TradeStage.CLOSED_SUCCESS, f"Take profit 2 hit at {price}."
+        if price <= trade.take_profit_1:
+            return TradeStage.CLOSED_SUCCESS, f"Take profit 1 hit at {price}."
+    return None, ""
+
+
+def _tracked_position_entry_and_size(profile, ticker: str) -> tuple[float | None, float | None]:
+    normalized = ticker.upper()
+    for position in profile.portfolio:
+        if position.ticker.upper() == normalized:
+            return float(position.entry_price), float(position.size)
+    return None, None
+
+
+def _trade_close_metrics(
+    trade: TrackedTrade,
+    signal: Signal,
+    entry_reference: float | None = None,
+    position_size: float | None = None,
+) -> dict[str, float | None]:
+    entry_price = float(entry_reference if entry_reference is not None else (trade.entry_low + trade.entry_high) / 2)
+    risk_per_unit = abs(entry_price - trade.stop_loss)
+
+    if trade.side == SignalSide.LONG:
+        pnl_per_unit = signal.current_price - entry_price
+    else:
+        pnl_per_unit = entry_price - signal.current_price
+
+    return_pct = 0.0 if entry_price == 0 else (pnl_per_unit / entry_price) * 100
+    r_multiple = 0.0 if risk_per_unit == 0 else pnl_per_unit / risk_per_unit
+    dollar_pnl = None if position_size is None else pnl_per_unit * position_size
+
+    return {
+        "entry_price": round(entry_price, 4),
+        "return_pct": round(return_pct, 2),
+        "r_multiple": round(r_multiple, 2),
+        "dollar_pnl": None if dollar_pnl is None else round(dollar_pnl, 2),
+        "position_size": position_size,
+    }
+
+
+def _arming_text(signal: Signal) -> str:
+    return "🟡 <b>ARMING</b> - get ready\n" + _signal_text(signal)
+
+
+def _signal_live_text(signal: Signal) -> str:
+    action_label = "buy now" if signal.side == SignalSide.LONG else "sell now"
+    return f"🚨 <b>SIGNAL</b> - {action_label}\n" + _signal_text(signal)
+
+
+def _closed_trade_text(
+    trade: TrackedTrade,
+    signal: Signal,
+    outcome: TradeStage,
+    reason: str,
+    entry_reference: float | None = None,
+    position_size: float | None = None,
+) -> str:
+    verdict = "SUCCESS" if outcome == TradeStage.CLOSED_SUCCESS else "FAILURE"
+    icon = "✅" if outcome == TradeStage.CLOSED_SUCCESS else "❌"
+    metrics = _trade_close_metrics(
+        trade,
+        signal,
+        entry_reference=entry_reference,
+        position_size=position_size,
+    )
+    pnl_line = (
+        f"Estimated P/L on tracked size: {metrics['dollar_pnl']}\n"
+        if metrics["dollar_pnl"] is not None
+        else f"Estimated P/L per unit: {round(signal.current_price - metrics['entry_price'], 4) if trade.side == SignalSide.LONG else round(metrics['entry_price'] - signal.current_price, 4)}\n"
+    )
+    return (
+        f"{icon} <b>SIGNAL CLOSED</b> - {verdict}\n"
+        f"Ticker: {trade.ticker}\n"
+        f"Direction: {trade.side.value}\n"
+        f"Opened: {trade.opened_at}\n"
+        f"Entry: {trade.entry_low} to {trade.entry_high}\n"
+        f"Assumed fill: {metrics['entry_price']}\n"
+        f"Stop: {trade.stop_loss}\n"
+        f"TP1: {trade.take_profit_1}\n"
+        f"TP2: {trade.take_profit_2}\n"
+        f"Close price: {signal.current_price}\n"
+        f"Return: {metrics['return_pct']}%\n"
+        f"R multiple: {metrics['r_multiple']}R\n"
+        f"{pnl_line}"
+        f"Result: {reason}\n"
+        f"<i>{signal.disclaimer}</i>"
+    )
+
+
+def _gameplan_text(gameplan: Gameplan) -> str:
+    actionable = [item for item in gameplan.top_trades if item.side != SignalSide.NEUTRAL][:3]
+    if not actionable:
+        return (
+            f"📬 <b>Daily Signal Digest</b> - {gameplan.generated_for}\n"
+            f"No strong actionable setups right now.\n"
+            f"Market note: {gameplan.macro_oracle[0]}"
+        )
+
+    signal_blocks = ["🚨 <b>Signal Setup</b>\n" + _signal_text(item) for item in actionable]
+    return (
+        f"📬 <b>Daily Signal Digest</b> - {gameplan.generated_for}\n"
+        f"Market note: {gameplan.macro_oracle[0]}\n\n"
+        + "\n\n".join(signal_blocks)
+    )
+
+
+def _scan_text(signals: list[Signal], source_label: str) -> str:
+    if not signals:
+        return f"📡 <b>Scan</b> - {source_label}\nNo valid signals returned."
+
+    lines = [
+        f"- <b>{signal.ticker}</b>: {signal.side.value} | {signal.confidence}% | {signal.signal_quality} | {signal.market_session}"
+        for signal in signals
+    ]
+    return f"📡 <b>Scan</b> - {source_label}\n" + "\n".join(lines)
+
+
+def build_handlers(
+    updater: Updater,
+    settings: Settings,
+    engine: SignalEngine,
+    state: UserStateStore,
+    learning_service: LearningService | None = None,
+    macro_risk_service: MacroRiskService | None = None,
+) -> None:
+    dispatcher = updater.dispatcher
+
+    def guarded_reply(update: Update, text: str) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        if chat_id:
+            state.get_profile(chat_id)
+        if not _authorized(settings, chat_id):
+            update.effective_message.reply_text("This bot is not enabled for this chat.")
+            return
+        update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+    def start(update: Update, context: CallbackContext) -> None:
+        guarded_reply(
+            update,
+            (
+                f"<b>{settings.bot_name}</b>\n"
+                "Commands: /signals <ticker>, /scan [tickers|preset], /analyze <ticker>, /news <ticker>, /gameplan, /watchlist, "
+                "/portfolio, /risk, /settings, /mychatid, /alerts, /stats, /model, /dashboard\n\n"
+                "Presets: crypto, stocks, forex, metals, energy, futures\n\n"
+                "This bot is for research and informational use only."
+            ),
+        )
+
+    def mychatid(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        guarded_reply(update, f"Your chat id is <code>{chat_id}</code>.")
+
+    def alerts(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        profile = state.get_profile(chat_id)
+
+        if not context.args:
+            guarded_reply(
+                update,
+                (
+                    f"Alert mode: <b>{profile.alert_mode}</b>\n"
+                    f"Global live alerts: {'on' if settings.live_alerts_enabled else 'off'}\n"
+                    f"Strong play threshold: {settings.strong_play_min_confidence}%\n"
+                    f"Tradable threshold: {settings.live_alert_min_confidence}%\n\n"
+                    "Lifecycle labels:\n"
+                    "- <b>ARMING</b>: get ready\n"
+                    "- <b>SIGNAL</b>: buy now or sell now\n"
+                    "- <b>SIGNAL CLOSED</b>: success or failure\n\n"
+                    "Modes:\n"
+                    "- <b>high</b>: arming plus strong buy-now signals\n"
+                    "- <b>all</b>: all tradable setups plus buy-now signals\n"
+                    "- <b>off</b>: mute push alerts"
+                ),
+            )
+            return
+
+        mode = context.args[0].lower()
+        if mode not in {"high", "all", "off"}:
+            guarded_reply(update, "Usage: /alerts [high|all|off]")
+            return
+        profile = state.set_alert_mode(chat_id, mode)
+        guarded_reply(update, f"Alert mode set to <b>{profile.alert_mode}</b>.")
+
+    def signals(update: Update, context: CallbackContext) -> None:
+        ticker = context.args[0] if context.args else settings.default_tickers[0]
+        try:
+            signal = engine.generate_signal(ticker)
+            guarded_reply(update, _signal_text(signal))
+        except Exception as exc:
+            guarded_reply(update, f"Could not generate a signal for {ticker}: {exc}")
+
+    def analyze(update: Update, context: CallbackContext) -> None:
+        ticker = context.args[0] if context.args else settings.default_tickers[0]
+        try:
+            snapshot, analyses = engine.analyze(ticker)
+            text = (
+                f"🔎 <b>Analysis</b> - {snapshot.ticker}\n"
+                f"Price: {snapshot.current_price} {snapshot.currency}\n"
+                f"Day Change: {round(snapshot.meta.get('day_change_pct', 0.0), 2)}%\n"
+                f"Asset: {snapshot.asset_class.value}\n\n"
+                + "\n".join(
+                    f"<b>{name.title()}</b>: {round(score.score, 2)} | {score.rationale[0]}"
+                    for name, score in analyses.items()
+                )
+            )
+            guarded_reply(update, text)
+        except Exception as exc:
+            guarded_reply(update, f"Could not analyze {ticker}: {exc}")
+
+    def gameplan(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        profile = state.get_profile(chat_id)
+        tickers = profile.watchlist or settings.default_tickers
+        plan = engine.generate_gameplan(tickers)
+        guarded_reply(update, _gameplan_text(plan))
+
+    def scan(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        profile = state.get_profile(chat_id)
+        source_label = "custom list"
+        if context.args and len(context.args) == 1 and context.args[0].lower() in SCAN_PRESETS:
+            preset = context.args[0].lower()
+            tickers = SCAN_PRESETS[preset]
+            source_label = f"{preset} preset"
+        elif context.args:
+            tickers = _parse_tickers(context.args)
+        else:
+            tickers = profile.watchlist or settings.default_tickers
+            source_label = "watchlist" if profile.watchlist else "default universe"
+
+        signals: list[Signal] = []
+        for ticker in tickers[:30]:
+            try:
+                signals.append(engine.generate_signal(ticker))
+            except Exception:
+                continue
+        ranked = sorted(signals, key=lambda item: item.confidence, reverse=True)[:10]
+        guarded_reply(update, _scan_text(ranked, source_label))
+
+    def news(update: Update, context: CallbackContext) -> None:
+        ticker = context.args[0] if context.args else settings.default_tickers[0]
+        try:
+            headlines = engine.get_news_brief(ticker)
+            if not headlines:
+                guarded_reply(update, f"No recent headlines available for {ticker}.")
+                return
+            lines = [
+                f"- <b>{item['source'] or 'Unknown source'}</b>: {item['title']}"
+                for item in headlines
+            ]
+            guarded_reply(update, f"📰 <b>News</b> - {ticker.upper()}\n" + "\n".join(lines))
+        except Exception as exc:
+            guarded_reply(update, f"Could not fetch news for {ticker}: {exc}")
+
+    def watchlist(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        profile = state.get_profile(chat_id)
+
+        if not context.args or context.args[0] == "list":
+            items = ", ".join(profile.watchlist) if profile.watchlist else "empty"
+            guarded_reply(update, f"Watchlist: {items}")
+            return
+
+        action = context.args[0].lower()
+        tickers = _parse_tickers(context.args[1:])
+
+        if action == "add":
+            if not tickers:
+                guarded_reply(update, "Usage: /watchlist add <ticker1> <ticker2> ...")
+                return
+            for ticker in tickers:
+                profile = state.add_watchlist(chat_id, ticker)
+            guarded_reply(update, f"Added: {', '.join(tickers)}\nWatchlist: {', '.join(profile.watchlist)}")
+            return
+        if action == "remove":
+            if not tickers:
+                guarded_reply(update, "Usage: /watchlist remove <ticker1> <ticker2> ...")
+                return
+            for ticker in tickers:
+                profile = state.remove_watchlist(chat_id, ticker)
+            guarded_reply(update, f"Removed: {', '.join(tickers)}\nWatchlist: {', '.join(profile.watchlist) or 'empty'}")
+            return
+        if action == "set":
+            if not tickers:
+                guarded_reply(update, "Usage: /watchlist set <ticker1> <ticker2> ...")
+                return
+            profile = state.set_watchlist(chat_id, tickers)
+            guarded_reply(update, f"Watchlist set: {', '.join(profile.watchlist)}")
+            return
+        if action == "clear":
+            state.clear_watchlist(chat_id)
+            guarded_reply(update, "Watchlist cleared.")
+            return
+
+        guarded_reply(update, "Usage: /watchlist add|remove|set <tickers...> | /watchlist clear | /watchlist list")
+
+    def portfolio(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        profile = state.get_profile(chat_id)
+
+        if not context.args or context.args[0] == "list":
+            if not profile.portfolio:
+                guarded_reply(update, "Portfolio is empty.")
+                return
+            lines = [
+                f"- {position.ticker}: entry {position.entry_price}, size {position.size}"
+                for position in profile.portfolio
+            ]
+            guarded_reply(update, "Portfolio:\n" + "\n".join(lines))
+            return
+
+        action = context.args[0].lower()
+        if action == "add" and len(context.args) == 4:
+            ticker, entry_price, size = context.args[1], float(context.args[2]), float(context.args[3])
+            state.add_portfolio_position(chat_id, ticker, entry_price, size)
+            guarded_reply(update, f"Tracked {ticker.upper()} at {entry_price} for size {size}.")
+            return
+        if action == "remove" and len(context.args) == 2:
+            state.remove_portfolio_position(chat_id, context.args[1])
+            guarded_reply(update, f"Removed {context.args[1].upper()} from tracked portfolio.")
+            return
+
+        guarded_reply(update, "Usage: /portfolio add <ticker> <entry> <size> | /portfolio remove <ticker> | /portfolio list")
+
+    def risk(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        profile = state.get_profile(chat_id)
+        report = engine.build_portfolio_risk_report(profile.portfolio)
+        text = (
+            f"⚠️ <b>Risk</b>\n"
+            f"Positions: {report.total_positions}\n"
+            f"Gross Exposure: {report.gross_exposure}\n"
+            f"Concentration: {report.concentration_risk}\n"
+            f"Notes:\n- " + "\n- ".join(report.warnings)
+        )
+        guarded_reply(update, text)
+
+    def settings_cmd(update: Update, context: CallbackContext) -> None:
+        text = (
+            f"Bot: {settings.bot_name}\n"
+            f"Default risk per trade: {settings.default_risk_per_trade:.2%}\n"
+            f"Daily gameplan: {settings.gameplan_hour_utc:02d}:{settings.gameplan_minute_utc:02d} UTC\n"
+            f"Live alerts: {'on' if settings.live_alerts_enabled else 'off'} every {settings.live_alert_interval_minutes}m, min confidence {settings.live_alert_min_confidence}, strong plays {settings.strong_play_min_confidence}\n"
+            f"Learning data: {settings.learning_data_dir} | min samples {settings.learning_min_sample_size} | max adjustment {settings.learning_max_confidence_adjustment}\n"
+            f"Weak edge filter: {'on' if settings.learning_block_negative_edges else 'off'} | threshold {settings.learning_weak_edge_threshold} | min samples {settings.learning_weak_edge_min_samples}\n"
+            f"Twelve Data: {'configured' if settings.twelvedata_api_key else 'fallback to Yahoo'}\n"
+            f"State backend: {state.backend_name()} ({'persistent' if state.persistence_enabled() else 'ephemeral'})\n"
+            f"Default tickers: {', '.join(settings.default_tickers)}\n"
+            f"Scan presets: {', '.join(sorted(SCAN_PRESETS.keys()))}"
+        )
+        guarded_reply(update, text)
+
+    def stats_cmd(update: Update, context: CallbackContext) -> None:
+        if learning_service is None:
+            guarded_reply(update, "Learning service is not active.")
+            return
+        scope = context.args[0].upper() if context.args else None
+        asset_classes = {item.value for item in AssetClass}
+        if scope and scope.lower() in asset_classes:
+            summary = learning_service.summary(asset_class=scope.lower())
+            label = f"asset class {scope.lower()}"
+        elif scope:
+            summary = learning_service.summary(ticker=scope)
+            label = scope
+        else:
+            summary = learning_service.summary()
+            label = "all closed trades"
+        guarded_reply(
+            update,
+            (
+                f"📊 <b>Learning Stats</b> - {label}\n"
+                f"Closed trades: {summary['total_trades']}\n"
+                f"Win rate: {summary['win_rate']}%\n"
+                f"Average R: {summary['avg_r']}\n"
+                f"Average return: {summary['avg_return_pct']}%\n"
+                f"Expectancy: {summary['expectancy']}R"
+            ),
+        )
+
+    def model_cmd(update: Update, context: CallbackContext) -> None:
+        if learning_service is None:
+            guarded_reply(update, "Learning service is not active.")
+            return
+        model = learning_service.model_snapshot()
+        lines: list[str] = ["🧠 <b>Learning Model</b>"]
+        for bucket_name in ("asset_class", "asset_session", "ticker", "side"):
+            bucket = model.get(bucket_name, {})
+            if not bucket:
+                continue
+            top = sorted(
+                bucket.items(),
+                key=lambda item: (abs(int(item[1].get("adjustment", 0))), int(item[1].get("samples", 0))),
+                reverse=True,
+            )[:3]
+            for key, payload in top:
+                lines.append(
+                    f"- {bucket_name}: <b>{key}</b> | adj {int(payload.get('adjustment', 0)):+d} | "
+                    f"samples {int(payload.get('samples', 0))} | win {payload.get('win_rate', 0)}% | avgR {payload.get('avg_r', 0)}"
+                )
+        if len(lines) == 1:
+            lines.append("- No learned edges yet. The bot needs more closed trades.")
+        guarded_reply(update, "\n".join(lines))
+
+    def dashboard_cmd(update: Update, context: CallbackContext) -> None:
+        if learning_service is None:
+            guarded_reply(update, "Learning service is not active.")
+            return
+        ticker = context.args[0] if context.args else settings.default_tickers[0]
+        dashboard = learning_service.dashboard(ticker)
+        summary = dashboard["summary"]
+        lines = [
+            f"📋 <b>Dashboard</b> - {dashboard['ticker']}",
+            f"Signal events: {dashboard['signal_events']}",
+            f"Closed trades: {summary['total_trades']}",
+            f"Win rate: {summary['win_rate']}%",
+            f"Average R: {summary['avg_r']}",
+            f"Average return: {summary['avg_return_pct']}%",
+            f"Expectancy: {summary['expectancy']}R",
+        ]
+        stage_counts = dashboard.get("stage_counts", {})
+        if stage_counts:
+            stage_line = ", ".join(f"{name}={count}" for name, count in sorted(stage_counts.items()))
+            lines.append(f"Stages: {stage_line}")
+        model_entries = dashboard.get("model_entries", [])
+        if model_entries:
+            lines.append("Learned edges:")
+            for item in model_entries[:3]:
+                lines.append(
+                    f"- {item['bucket']}: adj {int(item.get('adjustment', 0)):+d} | "
+                    f"samples {int(item.get('samples', 0))} | win {item.get('win_rate', 0)}% | avgR {item.get('avg_r', 0)}"
+                )
+        recent = dashboard.get("recent_closures", [])
+        if recent:
+            lines.append("Recent closures:")
+            for item in recent[:3]:
+                lines.append(
+                    f"- {item.get('outcome', '')}: return {item.get('return_pct', 0)}% | "
+                    f"R {item.get('r_multiple', 0)} | closed {str(item.get('closed_at', ''))[:10]}"
+                )
+        guarded_reply(update, "\n".join(lines))
+
+    def scheduled_gameplan(context: CallbackContext) -> None:
+        chat_ids = settings.allowed_chat_ids
+        if not chat_ids:
+            return
+        plan = engine.generate_gameplan(settings.default_tickers)
+        text = _gameplan_text(plan)
+        for chat_id in chat_ids:
+            context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+    def refresh_learning_model(context: CallbackContext) -> None:
+        del context
+        if learning_service is not None:
+            learning_service.refresh_model()
+
+    def live_alert_scan(context: CallbackContext) -> None:
+        if not settings.live_alerts_enabled:
+            return
+
+        chat_ids = set(settings.allowed_chat_ids) | set(state.list_chat_ids())
+        if not chat_ids:
+            return
+
+        chat_tickers: dict[int, list[str]] = {}
+        unique_tickers: list[str] = []
+        seen_tickers: set[str] = set()
+        for chat_id in sorted(chat_ids):
+            profile = state.get_profile(chat_id)
+            if profile.alert_mode == "off":
+                continue
+            tickers = (profile.watchlist or settings.default_tickers)[: settings.live_alert_ticker_limit]
+            chat_tickers[chat_id] = tickers
+            for ticker in tickers:
+                normalized = ticker.upper()
+                if normalized not in seen_tickers:
+                    seen_tickers.add(normalized)
+                    unique_tickers.append(normalized)
+
+        signal_cache: dict[str, Signal | None] = {}
+        macro_cache: dict[str, tuple[bool, str]] = {}
+        for ticker in unique_tickers:
+            try:
+                signal_cache[ticker] = engine.generate_signal(ticker)
+            except Exception:
+                signal_cache[ticker] = None
+
+        for chat_id, tickers in chat_tickers.items():
+            profile = state.get_profile(chat_id)
+            for ticker in tickers:
+                signal = signal_cache.get(ticker.upper())
+                if signal is None:
+                    continue
+
+                if signal.asset_class in {AssetClass.STOCK, AssetClass.ETF} and signal.market_session != "U.S. regular session":
+                    continue
+
+                tracked_trade = state.get_tracked_trade(chat_id, signal.ticker)
+
+                if tracked_trade is not None and tracked_trade.stage == TradeStage.SIGNAL:
+                    outcome, reason = _trade_close_outcome(tracked_trade, signal)
+                    if outcome is not None:
+                        entry_reference, position_size = _tracked_position_entry_and_size(profile, signal.ticker)
+                        close_metrics = _trade_close_metrics(
+                            tracked_trade,
+                            signal,
+                            entry_reference=entry_reference,
+                            position_size=position_size,
+                        )
+                        if state.should_send_alert(chat_id, signal.ticker, outcome.value, tracked_trade.confidence):
+                            context.bot.send_message(
+                                chat_id=chat_id,
+                                text=_closed_trade_text(
+                                    tracked_trade,
+                                    signal,
+                                    outcome,
+                                    reason,
+                                    entry_reference=entry_reference,
+                                    position_size=position_size,
+                                ),
+                                parse_mode=ParseMode.HTML,
+                            )
+                        if learning_service is not None:
+                            learning_service.record_trade_close(
+                                tracked_trade,
+                                signal,
+                                outcome,
+                                close_metrics,
+                            )
+                        state.clear_tracked_trade(chat_id, signal.ticker)
+                        continue
+
+                should_filter = False
+                reason = ""
+                if macro_risk_service is not None:
+                    cached = macro_cache.get(signal.ticker)
+                    if cached is None:
+                        cached = macro_risk_service.should_filter_alert(signal)
+                        macro_cache[signal.ticker] = cached
+                    should_filter, reason = cached
+                    if reason and reason not in signal.rationale:
+                        signal.rationale.insert(0, reason)
+
+                if should_filter:
+                    continue
+
+                if learning_service is not None:
+                    should_block, block_reason = learning_service.should_block_signal(signal)
+                    if should_block:
+                        continue
+                    if block_reason and block_reason not in signal.rationale:
+                        signal.rationale.insert(0, block_reason)
+
+                actionable = _is_actionable_signal(signal, settings)
+                strong_signal = _is_strong_signal(signal, settings)
+
+                if not actionable:
+                    if tracked_trade is not None and tracked_trade.stage == TradeStage.ARMING:
+                        state.clear_tracked_trade(chat_id, signal.ticker)
+                    continue
+
+                if tracked_trade is not None and tracked_trade.side != signal.side:
+                    state.clear_tracked_trade(chat_id, signal.ticker)
+                    tracked_trade = None
+
+                if tracked_trade is not None and tracked_trade.stage == TradeStage.SIGNAL:
+                    continue
+
+                if (
+                    tracked_trade is not None
+                    and tracked_trade.stage == TradeStage.ARMING
+                    and not strong_signal
+                ):
+                    continue
+
+                if strong_signal:
+                    trade_id = tracked_trade.trade_id if tracked_trade is not None else None
+                    tracked_trade = _build_tracked_trade(chat_id, signal, TradeStage.SIGNAL, trade_id=trade_id)
+                    state.set_tracked_trade(tracked_trade)
+                    if learning_service is not None:
+                        learning_service.record_signal_event(tracked_trade, TradeStage.SIGNAL)
+                    if state.should_send_alert(chat_id, signal.ticker, TradeStage.SIGNAL.value, signal.confidence):
+                        context.bot.send_message(
+                            chat_id=chat_id,
+                            text=_signal_live_text(signal),
+                            parse_mode=ParseMode.HTML,
+                        )
+                        if hasattr(state, "log_alert"):
+                            try:
+                                state.log_alert(chat_id, signal)  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                    continue
+
+                if profile.alert_mode == "high" and signal.signal_quality == "watchlist":
+                    continue
+
+                tracked_trade = _build_tracked_trade(chat_id, signal, TradeStage.ARMING)
+                state.set_tracked_trade(tracked_trade)
+                if learning_service is not None:
+                    learning_service.record_signal_event(tracked_trade, TradeStage.ARMING)
+                if state.should_send_alert(chat_id, signal.ticker, TradeStage.ARMING.value, signal.confidence):
+                    context.bot.send_message(
+                        chat_id=chat_id,
+                        text=_arming_text(signal),
+                        parse_mode=ParseMode.HTML,
+                    )
+
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("mychatid", mychatid))
+    dispatcher.add_handler(CommandHandler("alerts", alerts))
+    dispatcher.add_handler(CommandHandler("signals", signals))
+    dispatcher.add_handler(CommandHandler("scan", scan))
+    dispatcher.add_handler(CommandHandler("analyze", analyze))
+    dispatcher.add_handler(CommandHandler("news", news))
+    dispatcher.add_handler(CommandHandler("gameplan", gameplan))
+    dispatcher.add_handler(CommandHandler("watchlist", watchlist))
+    dispatcher.add_handler(CommandHandler("portfolio", portfolio))
+    dispatcher.add_handler(CommandHandler("risk", risk))
+    dispatcher.add_handler(CommandHandler("stats", stats_cmd))
+    dispatcher.add_handler(CommandHandler("model", model_cmd))
+    dispatcher.add_handler(CommandHandler("dashboard", dashboard_cmd))
+    dispatcher.add_handler(CommandHandler("settings", settings_cmd))
+
+    if updater.job_queue is not None:
+        updater.job_queue.run_daily(
+            scheduled_gameplan,
+            time(hour=settings.gameplan_hour_utc, minute=settings.gameplan_minute_utc),
+            name="daily_gameplan",
+        )
+        updater.job_queue.run_repeating(
+            live_alert_scan,
+            interval=max(60, settings.live_alert_interval_minutes * 60),
+            first=15,
+            name="live_alert_scan",
+        )
+        updater.job_queue.run_repeating(
+            refresh_learning_model,
+            interval=6 * 60 * 60,
+            first=30,
+            name="refresh_learning_model",
+        )

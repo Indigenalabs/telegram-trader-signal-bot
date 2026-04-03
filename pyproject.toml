@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultimate-trader-signal-bot"
+version = "0.1.0"
+description = "Telegram trading signal bot with modular analysis and multiverse gameplans."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "python-telegram-bot>=13.7,<14.0",
+  "requests>=2.31.0,<3.0.0",
+  "google-auth>=2.29.0,<3.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

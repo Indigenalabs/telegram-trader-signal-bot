@@ -1,0 +1,289 @@
+import unittest
+from datetime import datetime, timezone
+from tempfile import TemporaryDirectory
+
+from trader_signal_bot.bot.handlers import (
+    _build_tracked_trade,
+    _is_actionable_signal,
+    _is_strong_signal,
+    _parse_tickers,
+    _trade_close_metrics,
+    _trade_close_outcome,
+)
+from trader_signal_bot.config import SCAN_PRESETS
+from trader_signal_bot.domain import AssetClass, PriceSnapshot, Signal, SignalSide, TradeStage
+from trader_signal_bot.config import Settings
+from trader_signal_bot.services.analysis import market_session_label, risk_analysis, technical_analysis
+from trader_signal_bot.services.learning import LearningService
+from trader_signal_bot.services.market_data import _to_binance_symbol
+from trader_signal_bot.services.news import NewsService, ticker_to_query
+from trader_signal_bot.services.registry import get_instrument_profile
+from trader_signal_bot.services.state import UserStateStore
+
+
+class AnalysisTests(unittest.TestCase):
+    def _sample_signal(
+        self,
+        *,
+        ticker: str = "BTC-USD",
+        side: SignalSide = SignalSide.LONG,
+        current_price: float = 100.0,
+        confidence: int = 67,
+        quality: str = "high",
+    ) -> Signal:
+        return Signal(
+            ticker=ticker,
+            asset_class=AssetClass.CRYPTO,
+            side=side,
+            current_price=current_price,
+            entry_low=99.0,
+            entry_high=101.0,
+            stop_loss=95.0 if side == SignalSide.LONG else 105.0,
+            take_profit_1=108.0 if side == SignalSide.LONG else 92.0,
+            take_profit_2=112.0 if side == SignalSide.LONG else 88.0,
+            confidence=confidence,
+            timeframe="2-5 days",
+            rationale=["Trend is aligned."],
+            scores={"technical": 70.0},
+            price_source="Binance",
+            pricing_symbol="BTCUSDT",
+            pricing_currency="USD",
+            market_session="24/7 crypto market",
+            signal_quality=quality,
+        )
+
+    def test_binance_symbol_mapping(self) -> None:
+        self.assertEqual(_to_binance_symbol("BTC-USD"), "BTCUSDT")
+        self.assertEqual(_to_binance_symbol("eth-usdt"), "ETHUSDT")
+        self.assertIsNone(_to_binance_symbol("SPY"))
+
+    def test_news_query_mapping(self) -> None:
+        self.assertEqual(ticker_to_query("BTC-USD"), "Bitcoin OR BTC OR crypto market")
+        self.assertEqual(ticker_to_query("SPY"), "S&P 500 OR SPY ETF")
+        self.assertIn("Facebook", ticker_to_query("META"))
+
+    def test_registry_returns_company_aliases(self) -> None:
+        profile = get_instrument_profile("META")
+        self.assertEqual(profile.display_name, "Meta Platforms")
+        self.assertIn("Instagram", profile.news_query)
+
+    def test_parse_tickers_supports_spaces_and_commas(self) -> None:
+        self.assertEqual(
+            _parse_tickers(["btc-usd,eth-usd", "spy", "ETH-USD"]),
+            ["BTC-USD", "ETH-USD", "SPY"],
+        )
+
+    def test_watchlist_set_and_clear(self) -> None:
+        store = UserStateStore(default_risk_per_trade=0.01)
+        profile = store.set_watchlist(1, ["BTC-USD", "ETH-USD", "BTC-USD"])
+        self.assertEqual(profile.watchlist, ["BTC-USD", "ETH-USD"])
+        cleared = store.clear_watchlist(1)
+        self.assertEqual(cleared.watchlist, [])
+        updated = store.set_alert_mode(1, "off")
+        self.assertEqual(updated.alert_mode, "off")
+        self.assertEqual(store.backend_name(), "memory")
+        self.assertFalse(store.persistence_enabled())
+
+    def test_alert_deduping_requires_change(self) -> None:
+        store = UserStateStore(default_risk_per_trade=0.01)
+        self.assertTrue(store.should_send_alert(1, "BTC-USD", "LONG", 61))
+        self.assertFalse(store.should_send_alert(1, "BTC-USD", "LONG", 61))
+        self.assertFalse(store.should_send_alert(1, "BTC-USD", "LONG", 64))
+        self.assertTrue(store.should_send_alert(1, "BTC-USD", "LONG", 66))
+        self.assertTrue(store.should_send_alert(1, "BTC-USD", "SHORT", 66))
+
+    def test_tracked_trade_round_trip(self) -> None:
+        store = UserStateStore(default_risk_per_trade=0.01)
+        trade = _build_tracked_trade(1, self._sample_signal(), TradeStage.ARMING)
+        store.set_tracked_trade(trade)
+        loaded = store.get_tracked_trade(1, "btc-usd")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.stage, TradeStage.ARMING)
+        store.clear_tracked_trade(1, "BTC-USD")
+        self.assertIsNone(store.get_tracked_trade(1, "BTC-USD"))
+
+    def test_signal_threshold_helpers(self) -> None:
+        settings = Settings()
+        strong_signal = self._sample_signal(confidence=69, quality="high")
+        arming_signal = self._sample_signal(confidence=60, quality="tradable")
+        weak_signal = self._sample_signal(confidence=54, quality="watchlist")
+
+        self.assertTrue(_is_actionable_signal(strong_signal, settings))
+        self.assertTrue(_is_strong_signal(strong_signal, settings))
+        self.assertTrue(_is_actionable_signal(arming_signal, settings))
+        self.assertFalse(_is_strong_signal(arming_signal, settings))
+        self.assertFalse(_is_actionable_signal(weak_signal, settings))
+
+    def test_trade_close_outcome_hits_take_profit_for_long(self) -> None:
+        trade = _build_tracked_trade(1, self._sample_signal(), TradeStage.SIGNAL)
+        live_signal = self._sample_signal(current_price=109.0)
+        outcome, reason = _trade_close_outcome(trade, live_signal)
+        self.assertEqual(outcome, TradeStage.CLOSED_SUCCESS)
+        self.assertIn("Take profit 1", reason)
+
+    def test_trade_close_outcome_hits_stop_for_short(self) -> None:
+        entry_signal = self._sample_signal(side=SignalSide.SHORT, current_price=100.0)
+        trade = _build_tracked_trade(1, entry_signal, TradeStage.SIGNAL)
+        live_signal = self._sample_signal(side=SignalSide.SHORT, current_price=106.0)
+        outcome, reason = _trade_close_outcome(trade, live_signal)
+        self.assertEqual(outcome, TradeStage.CLOSED_FAILURE)
+        self.assertIn("Stop loss", reason)
+
+    def test_trade_close_metrics_include_return_r_and_position_pnl(self) -> None:
+        trade = _build_tracked_trade(1, self._sample_signal(), TradeStage.SIGNAL)
+        live_signal = self._sample_signal(current_price=109.0)
+        metrics = _trade_close_metrics(trade, live_signal, position_size=2.5)
+        self.assertEqual(metrics["entry_price"], 100.0)
+        self.assertEqual(metrics["return_pct"], 9.0)
+        self.assertEqual(metrics["r_multiple"], 1.8)
+        self.assertEqual(metrics["dollar_pnl"], 22.5)
+
+    def test_learning_service_applies_positive_adjustment_after_enough_wins(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            learning = LearningService(data_dir=temp_dir, min_sample_size=3, max_confidence_adjustment=8)
+            for _ in range(3):
+                trade = _build_tracked_trade(1, self._sample_signal(), TradeStage.SIGNAL)
+                close_signal = self._sample_signal(current_price=112.0)
+                metrics = _trade_close_metrics(trade, close_signal)
+                learning.record_trade_close(trade, close_signal, TradeStage.CLOSED_SUCCESS, metrics)
+
+            signal = self._sample_signal(confidence=62, quality="tradable")
+            adjusted = learning.apply_to_signal(signal)
+            self.assertGreater(adjusted.confidence, 62)
+            self.assertGreaterEqual(adjusted.learning_adjustment, 1)
+            self.assertTrue(adjusted.learning_notes)
+
+    def test_learning_service_summary_reports_closed_trade_stats(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            learning = LearningService(data_dir=temp_dir, min_sample_size=2, max_confidence_adjustment=8)
+            winning_trade = _build_tracked_trade(1, self._sample_signal(), TradeStage.SIGNAL)
+            winning_signal = self._sample_signal(current_price=109.0)
+            learning.record_trade_close(
+                winning_trade,
+                winning_signal,
+                TradeStage.CLOSED_SUCCESS,
+                _trade_close_metrics(winning_trade, winning_signal),
+            )
+            losing_trade = _build_tracked_trade(1, self._sample_signal(side=SignalSide.SHORT), TradeStage.SIGNAL)
+            losing_signal = self._sample_signal(side=SignalSide.SHORT, current_price=106.0)
+            learning.record_trade_close(
+                losing_trade,
+                losing_signal,
+                TradeStage.CLOSED_FAILURE,
+                _trade_close_metrics(losing_trade, losing_signal),
+            )
+            summary = learning.summary()
+            self.assertEqual(summary["total_trades"], 2)
+            self.assertEqual(summary["win_rate"], 50.0)
+
+    def test_learning_service_can_block_weak_negative_edge(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            learning = LearningService(
+                data_dir=temp_dir,
+                min_sample_size=3,
+                max_confidence_adjustment=8,
+                block_negative_edges=True,
+                weak_edge_threshold=-4,
+                weak_edge_min_samples=4,
+            )
+            for _ in range(4):
+                trade = _build_tracked_trade(1, self._sample_signal(side=SignalSide.SHORT), TradeStage.SIGNAL)
+                losing_signal = self._sample_signal(side=SignalSide.SHORT, current_price=106.0)
+                learning.record_trade_close(
+                    trade,
+                    losing_signal,
+                    TradeStage.CLOSED_FAILURE,
+                    _trade_close_metrics(trade, losing_signal),
+                )
+            should_block, reason = learning.should_block_signal(self._sample_signal(side=SignalSide.SHORT))
+            self.assertTrue(should_block)
+            self.assertIn("weak", reason.lower())
+
+    def test_learning_service_dashboard_returns_recent_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            learning = LearningService(data_dir=temp_dir, min_sample_size=2, max_confidence_adjustment=8)
+            for _ in range(2):
+                trade = _build_tracked_trade(1, self._sample_signal(ticker="ETH-USD"), TradeStage.SIGNAL)
+                close_signal = self._sample_signal(ticker="ETH-USD", current_price=109.0)
+                learning.record_trade_close(
+                    trade,
+                    close_signal,
+                    TradeStage.CLOSED_SUCCESS,
+                    _trade_close_metrics(trade, close_signal),
+                )
+            dashboard = learning.dashboard("ETH-USD")
+            self.assertEqual(dashboard["ticker"], "ETH-USD")
+            self.assertEqual(dashboard["summary"]["total_trades"], 2)
+            self.assertTrue(dashboard["recent_closures"])
+
+    def test_scan_presets_include_metals_and_energy(self) -> None:
+        self.assertIn("GC=F", SCAN_PRESETS["metals"])
+        self.assertIn("SI=F", SCAN_PRESETS["metals"])
+        self.assertIn("CL=F", SCAN_PRESETS["energy"])
+
+    def test_market_session_label_for_crypto_is_24_7(self) -> None:
+        snapshot = PriceSnapshot(
+            ticker="BTC-USD",
+            asset_class=AssetClass.CRYPTO,
+            currency="USD",
+            current_price=1.0,
+            previous_close=1.0,
+            high=1.0,
+            low=1.0,
+            volume=1.0,
+            history=[1.0, 1.0],
+        )
+        self.assertEqual(market_session_label(snapshot), "24/7 crypto market")
+
+    def test_market_session_label_for_stocks_regular_session(self) -> None:
+        snapshot = PriceSnapshot(
+            ticker="AAPL",
+            asset_class=AssetClass.STOCK,
+            currency="USD",
+            current_price=1.0,
+            previous_close=1.0,
+            high=1.0,
+            low=1.0,
+            volume=1.0,
+            history=[1.0, 1.0],
+        )
+        now = datetime(2026, 3, 24, 15, 0, tzinfo=timezone.utc)
+        self.assertEqual(market_session_label(snapshot, now=now), "U.S. regular session")
+
+    def test_technical_analysis_scores_bullish_series(self) -> None:
+        snapshot = PriceSnapshot(
+            ticker="TEST",
+            asset_class=AssetClass.STOCK,
+            currency="USD",
+            current_price=30.0,
+            previous_close=29.5,
+            high=30.2,
+            low=29.8,
+            volume=1_000_000,
+            history=[float(value) for value in range(1, 31)],
+            meta={},
+        )
+
+        score = technical_analysis(snapshot)
+        self.assertGreater(score.score, 60)
+
+    def test_risk_analysis_penalizes_volatile_series(self) -> None:
+        snapshot = PriceSnapshot(
+            ticker="TEST",
+            asset_class=AssetClass.CRYPTO,
+            currency="USD",
+            current_price=100.0,
+            previous_close=90.0,
+            high=110.0,
+            low=80.0,
+            volume=1_000_000,
+            history=[100, 120, 80, 125, 78, 130, 75, 128, 82, 135, 79, 140, 85, 145, 100],
+            meta={},
+        )
+
+        score = risk_analysis(snapshot)
+        self.assertLess(score.score, 70)
+
+
+if __name__ == "__main__":
+    unittest.main()
