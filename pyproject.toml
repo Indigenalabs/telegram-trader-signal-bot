@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "python-telegram-bot>=13.7,<14.0",
   "requests>=2.31.0,<3.0.0",
+  "urllib3<2.0.0",
   "google-auth>=2.29.0,<3.0.0",
 ]
 
