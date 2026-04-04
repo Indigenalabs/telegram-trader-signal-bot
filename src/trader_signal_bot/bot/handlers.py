@@ -109,6 +109,11 @@ def _build_tracked_trade(
     stage: TradeStage,
     trade_id: str | None = None,
 ) -> TrackedTrade:
+    scores = signal.scores.copy()
+    scores["edge_score"] = float(signal.edge_score)
+    scores["confluence_count"] = float(signal.confluence_count)
+    scores["learned_expectancy"] = float(signal.learned_expectancy)
+    scores["learned_win_rate"] = float(signal.learned_win_rate)
     return TrackedTrade(
         trade_id=trade_id or str(uuid4()),
         chat_id=chat_id,
@@ -124,7 +129,7 @@ def _build_tracked_trade(
         confidence=signal.confidence,
         market_session=signal.market_session,
         signal_quality=signal.signal_quality,
-        scores=signal.scores.copy(),
+        scores=scores,
         opened_at=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -286,7 +291,7 @@ def build_handlers(
             (
                 f"<b>{settings.bot_name}</b>\n"
                 "Commands: /signals <ticker>, /scan [tickers|preset], /analyze <ticker>, /news <ticker>, /gameplan, /watchlist, "
-                "/portfolio, /risk, /settings, /mychatid, /alerts, /stats, /model, /dashboard\n\n"
+                "/portfolio, /risk, /settings, /mychatid, /alerts, /stats, /model, /dashboard, /metrics\n\n"
                 "Presets: crypto, stocks, forex, metals, energy, futures\n\n"
                 "This bot is for research and informational use only."
             ),
@@ -493,6 +498,7 @@ def build_handlers(
             f"Live alerts: {'on' if settings.live_alerts_enabled else 'off'} every {settings.live_alert_interval_minutes}m, min confidence {settings.live_alert_min_confidence}, strong plays {settings.strong_play_min_confidence}\n"
             f"Edge mode: {'on' if settings.edge_over_speed_mode else 'off'} | min confluence {settings.signal_min_confluence} | high confluence {settings.high_quality_min_confluence} | edge floor {settings.edge_score_min_alert}/{settings.edge_score_min_high_quality}\n"
             f"Learning data: {settings.learning_data_dir} | min samples {settings.learning_min_sample_size} | max adjustment {settings.learning_max_confidence_adjustment}\n"
+            f"Learning SQLite: {'on' if settings.learning_sqlite_enabled else 'off'} | path {settings.learning_sqlite_path}\n"
             f"Namespaces: bot {settings.bot_namespace} | learning {settings.learning_namespace}\n"
             f"Weak edge filter: {'on' if settings.learning_block_negative_edges else 'off'} | threshold {settings.learning_weak_edge_threshold} | min samples {settings.learning_weak_edge_min_samples}\n"
             f"Twelve Data: {'configured' if settings.twelvedata_api_key else 'fallback to Yahoo'}\n"
@@ -552,6 +558,32 @@ def build_handlers(
         if len(lines) == 1:
             lines.append("- No learned edges yet. The bot needs more closed trades.")
         guarded_reply(update, "\n".join(lines))
+
+    def metrics_cmd(update: Update, context: CallbackContext) -> None:
+        if learning_service is None:
+            guarded_reply(update, "Learning service is not active.")
+            return
+        period_type = context.args[0].lower() if context.args else "daily"
+        if period_type not in {"daily", "weekly"}:
+            guarded_reply(update, "Usage: /metrics [daily|weekly]")
+            return
+        metrics = learning_service.metrics_summary(period_type)
+        guarded_reply(
+            update,
+            (
+                f"📐 <b>{period_type.title()} Performance</b>\n"
+                f"Window: {metrics['period_start']} to {metrics['period_end']}\n"
+                f"Closed trades: {metrics['total_trades']}\n"
+                f"Winning trades: {metrics['winning_trades']}\n"
+                f"Win rate: {metrics['win_rate']}%\n"
+                f"Total P/L: {metrics['total_pnl']}\n"
+                f"ROI: {metrics['roi']}%\n"
+                f"Average win: {metrics['avg_win']}\n"
+                f"Average loss: {metrics['avg_loss']}\n"
+                f"Profit factor: {metrics['profit_factor']}\n"
+                f"Expectancy: {metrics['expectancy']}R"
+            ),
+        )
 
     def dashboard_cmd(update: Update, context: CallbackContext) -> None:
         if learning_service is None:
@@ -771,6 +803,7 @@ def build_handlers(
     dispatcher.add_handler(CommandHandler("stats", stats_cmd))
     dispatcher.add_handler(CommandHandler("model", model_cmd))
     dispatcher.add_handler(CommandHandler("dashboard", dashboard_cmd))
+    dispatcher.add_handler(CommandHandler("metrics", metrics_cmd))
     dispatcher.add_handler(CommandHandler("settings", settings_cmd))
 
     if updater.job_queue is not None:

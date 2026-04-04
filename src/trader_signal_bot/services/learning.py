@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from trader_signal_bot.domain import AssetClass, Signal, SignalSide, TrackedTrade, TradeStage
+from trader_signal_bot.services.sqlite_learning_store import SQLiteLearningStore
 
 
 class LearningService:
@@ -14,6 +15,7 @@ class LearningService:
         self,
         data_dir: str,
         namespace: str = "default",
+        sqlite_database_path: str | None = None,
         min_sample_size: int = 3,
         max_confidence_adjustment: int = 8,
         block_negative_edges: bool = True,
@@ -32,6 +34,7 @@ class LearningService:
         self.block_negative_edges = block_negative_edges
         self.weak_edge_threshold = weak_edge_threshold
         self.weak_edge_min_samples = max(self.min_sample_size, weak_edge_min_samples)
+        self.sqlite_store = SQLiteLearningStore(sqlite_database_path, namespace=self.namespace) if sqlite_database_path else None
         self.history: dict[str, list[dict[str, Any]]] = {"signals": [], "closures": []}
         self.model: dict[str, dict[str, Any]] = {
             "asset_class": {},
@@ -40,6 +43,10 @@ class LearningService:
             "side": {},
         }
         self._load()
+
+    def close(self) -> None:
+        if self.sqlite_store is not None:
+            self.sqlite_store.close()
 
     def _load(self) -> None:
         if self.history_path.exists():
@@ -89,6 +96,8 @@ class LearningService:
         if existing is None:
             self.history["signals"].append(record)
             self._save_history()
+        if self.sqlite_store is not None:
+            self.sqlite_store.record_signal_event(trade, stage)
 
     def record_trade_close(
         self,
@@ -121,6 +130,8 @@ class LearningService:
         ]
         self.history["closures"].append(record)
         self._save_history()
+        if self.sqlite_store is not None:
+            self.sqlite_store.record_trade_close(trade, signal, outcome, metrics)
         self.refresh_model()
 
     def _bucket_key(self, asset_class: str, market_session: str, ticker: str, side: str) -> dict[str, str]:
@@ -318,6 +329,24 @@ class LearningService:
 
     def model_snapshot(self) -> dict[str, dict[str, Any]]:
         return self.model
+
+    def metrics_summary(self, period_type: str = "daily") -> dict[str, Any]:
+        if self.sqlite_store is not None:
+            return self.sqlite_store.metrics_summary(period_type)
+        return {
+            "period_type": period_type,
+            "period_start": "",
+            "period_end": "",
+            "total_trades": 0,
+            "winning_trades": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "roi": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+        }
 
     def dashboard(self, ticker: str) -> dict[str, Any]:
         normalized = ticker.upper()

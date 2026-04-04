@@ -32,6 +32,7 @@ def main() -> None:
     learning_service = LearningService(
         data_dir=settings.learning_data_dir,
         namespace=settings.learning_namespace,
+        sqlite_database_path=settings.learning_sqlite_path if settings.learning_sqlite_enabled else None,
         min_sample_size=settings.learning_min_sample_size,
         max_confidence_adjustment=settings.learning_max_confidence_adjustment,
         block_negative_edges=settings.learning_block_negative_edges,

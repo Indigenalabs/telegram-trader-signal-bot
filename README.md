@@ -94,6 +94,22 @@ That database stores:
 - alert mode
 - tracked live trade lifecycle state
 
+The same SQLite file can also hold learning analytics tables:
+- `signals`
+- `trades`
+- `performance_metrics`
+
+Those tables let the bot calculate:
+- win rate
+- profit factor
+- ROI
+- average win / average loss
+- expectancy
+
+You can inspect the latest summary in Telegram with:
+- `/metrics`
+- `/metrics weekly`
+
 For multi-bot setups:
 - use a unique `BOT_NAMESPACE` per bot if they share the same SQLite file
 - use the same `LEARNING_NAMESPACE` only when you explicitly want multiple bots to learn from one shared outcome pool

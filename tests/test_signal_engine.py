@@ -230,6 +230,34 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(dashboard["summary"]["total_trades"], 2)
             self.assertTrue(dashboard["recent_closures"])
 
+    def test_learning_service_writes_sqlite_metrics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            db_path = f"{temp_dir}/learning.db"
+            learning = LearningService(
+                data_dir=temp_dir,
+                namespace="metrics_bot",
+                sqlite_database_path=db_path,
+                min_sample_size=2,
+                max_confidence_adjustment=8,
+            )
+            for _ in range(2):
+                trade = _build_tracked_trade(1, self._sample_signal(ticker="SOL-USD"), TradeStage.SIGNAL)
+                close_signal = self._sample_signal(ticker="SOL-USD", current_price=109.0)
+                learning.record_signal_event(trade, TradeStage.SIGNAL)
+                learning.record_trade_close(
+                    trade,
+                    close_signal,
+                    TradeStage.CLOSED_SUCCESS,
+                    _trade_close_metrics(trade, close_signal),
+                )
+
+            metrics = learning.metrics_summary("daily")
+            self.assertEqual(metrics["total_trades"], 2)
+            self.assertEqual(metrics["winning_trades"], 2)
+            self.assertGreater(metrics["profit_factor"], 0.0)
+            self.assertGreater(metrics["expectancy"], 0.0)
+            learning.close()
+
     def test_sqlite_state_store_persists_profiles_and_tracked_trades(self) -> None:
         with TemporaryDirectory() as temp_dir:
             db_path = f"{temp_dir}/bot_state.db"

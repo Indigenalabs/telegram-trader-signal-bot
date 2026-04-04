@@ -103,6 +103,13 @@ class Settings:
         "on",
     }
     sqlite_state_path: str = os.getenv("SQLITE_STATE_PATH", "data/bot_state.db")
+    learning_sqlite_enabled: bool = os.getenv("LEARNING_SQLITE_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    learning_sqlite_path: str = os.getenv("LEARNING_SQLITE_PATH", "")
     learning_data_dir: str = os.getenv("LEARNING_DATA_DIR", "data")
     learning_min_sample_size: int = int(os.getenv("LEARNING_MIN_SAMPLE_SIZE", "3"))
     learning_max_confidence_adjustment: int = int(os.getenv("LEARNING_MAX_CONFIDENCE_ADJUSTMENT", "8"))
@@ -134,6 +141,8 @@ class Settings:
     def __post_init__(self) -> None:
         if not self.learning_namespace:
             self.learning_namespace = self.bot_namespace
+        if not self.learning_sqlite_path:
+            self.learning_sqlite_path = self.sqlite_state_path
 
     def require_token(self) -> None:
         if not self.telegram_bot_token:
