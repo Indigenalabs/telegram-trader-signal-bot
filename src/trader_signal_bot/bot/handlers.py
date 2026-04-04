@@ -266,6 +266,35 @@ def _scan_text(signals: list[Signal], source_label: str) -> str:
     return f"📡 <b>Scan</b> - {source_label}\n" + "\n".join(lines)
 
 
+def _performance_report_text(metrics: dict[str, object], period_label: str) -> str:
+    return (
+        f"📊 <b>{period_label} Signal Report</b>\n"
+        f"Window: {metrics['period_start']} to {metrics['period_end']}\n"
+        f"Signals closed: {metrics['total_trades']}\n"
+        f"Hits: {metrics['hits']}\n"
+        f"Misses: {metrics['misses']}\n"
+        f"Win rate: {metrics['win_rate']}%\n"
+        f"Total P/L: {metrics['total_pnl']}\n"
+        f"ROI: {metrics['roi']}%\n"
+        f"Average win: {metrics['avg_win']}\n"
+        f"Average loss: {metrics['avg_loss']}\n"
+        f"Profit factor: {metrics['profit_factor']}\n"
+        f"Expectancy: {metrics['expectancy']}R"
+    )
+
+
+def _leaderboard_text(rows: list[dict[str, object]], period_type: str, group_by: str) -> str:
+    if not rows:
+        return f"🏁 <b>{period_type.title()} Leaderboard</b>\nNo closed trades recorded for this window yet."
+    lines = [f"🏁 <b>{period_type.title()} Leaderboard</b> - by {group_by}"]
+    for item in rows:
+        lines.append(
+            f"- <b>{item['label']}</b>: hits {item['winning_trades']} | misses {item['losing_trades']} | "
+            f"win {item['win_rate']}% | avgR {item['avg_r']} | pnl {item['total_pnl']}"
+        )
+    return "\n".join(lines)
+
+
 def build_handlers(
     updater: Updater,
     settings: Settings,
@@ -291,7 +320,7 @@ def build_handlers(
             (
                 f"<b>{settings.bot_name}</b>\n"
                 "Commands: /signals <ticker>, /scan [tickers|preset], /analyze <ticker>, /news <ticker>, /gameplan, /watchlist, "
-                "/portfolio, /risk, /settings, /mychatid, /alerts, /stats, /model, /dashboard, /metrics\n\n"
+                "/portfolio, /risk, /settings, /mychatid, /alerts, /stats, /model, /dashboard, /metrics, /report, /leaderboard\n\n"
                 "Presets: crypto, stocks, forex, metals, energy, futures\n\n"
                 "This bot is for research and informational use only."
             ),
@@ -568,22 +597,30 @@ def build_handlers(
             guarded_reply(update, "Usage: /metrics [daily|weekly]")
             return
         metrics = learning_service.metrics_summary(period_type)
-        guarded_reply(
-            update,
-            (
-                f"📐 <b>{period_type.title()} Performance</b>\n"
-                f"Window: {metrics['period_start']} to {metrics['period_end']}\n"
-                f"Closed trades: {metrics['total_trades']}\n"
-                f"Winning trades: {metrics['winning_trades']}\n"
-                f"Win rate: {metrics['win_rate']}%\n"
-                f"Total P/L: {metrics['total_pnl']}\n"
-                f"ROI: {metrics['roi']}%\n"
-                f"Average win: {metrics['avg_win']}\n"
-                f"Average loss: {metrics['avg_loss']}\n"
-                f"Profit factor: {metrics['profit_factor']}\n"
-                f"Expectancy: {metrics['expectancy']}R"
-            ),
-        )
+        guarded_reply(update, _performance_report_text(metrics, period_type.title()))
+
+    def report_cmd(update: Update, context: CallbackContext) -> None:
+        if learning_service is None:
+            guarded_reply(update, "Learning service is not active.")
+            return
+        period_type = context.args[0].lower() if context.args else "daily"
+        if period_type not in {"daily", "weekly"}:
+            guarded_reply(update, "Usage: /report [daily|weekly]")
+            return
+        metrics = learning_service.metrics_summary(period_type)
+        guarded_reply(update, _performance_report_text(metrics, period_type.title()))
+
+    def leaderboard_cmd(update: Update, context: CallbackContext) -> None:
+        if learning_service is None:
+            guarded_reply(update, "Learning service is not active.")
+            return
+        period_type = context.args[0].lower() if context.args else "weekly"
+        group_by = context.args[1].lower() if len(context.args) > 1 else "ticker"
+        if period_type not in {"daily", "weekly"} or group_by not in {"ticker", "session", "asset"}:
+            guarded_reply(update, "Usage: /leaderboard [daily|weekly] [ticker|session|asset]")
+            return
+        rows = learning_service.leaderboard(period_type=period_type, group_by=group_by, limit=5)
+        guarded_reply(update, _leaderboard_text(rows, period_type, group_by))
 
     def dashboard_cmd(update: Update, context: CallbackContext) -> None:
         if learning_service is None:
@@ -630,6 +667,30 @@ def build_handlers(
         plan = engine.generate_gameplan(settings.default_tickers)
         text = _gameplan_text(plan)
         for chat_id in chat_ids:
+            context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+    def scheduled_report(context: CallbackContext) -> None:
+        if learning_service is None:
+            return
+        chat_ids = set(settings.allowed_chat_ids) | set(state.list_chat_ids())
+        if not chat_ids:
+            return
+        metrics = learning_service.metrics_summary("daily")
+        text = _performance_report_text(metrics, "Daily")
+        for chat_id in sorted(chat_ids):
+            context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+
+    def scheduled_weekly_report(context: CallbackContext) -> None:
+        if learning_service is None:
+            return
+        if datetime.now(timezone.utc).weekday() != 0:
+            return
+        chat_ids = set(settings.allowed_chat_ids) | set(state.list_chat_ids())
+        if not chat_ids:
+            return
+        metrics = learning_service.metrics_summary("weekly")
+        text = _performance_report_text(metrics, "Weekly")
+        for chat_id in sorted(chat_ids):
             context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
 
     def refresh_learning_model(context: CallbackContext) -> None:
@@ -804,6 +865,8 @@ def build_handlers(
     dispatcher.add_handler(CommandHandler("model", model_cmd))
     dispatcher.add_handler(CommandHandler("dashboard", dashboard_cmd))
     dispatcher.add_handler(CommandHandler("metrics", metrics_cmd))
+    dispatcher.add_handler(CommandHandler("report", report_cmd))
+    dispatcher.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     dispatcher.add_handler(CommandHandler("settings", settings_cmd))
 
     if updater.job_queue is not None:
@@ -823,4 +886,14 @@ def build_handlers(
             interval=6 * 60 * 60,
             first=30,
             name="refresh_learning_model",
+        )
+        updater.job_queue.run_daily(
+            scheduled_report,
+            time(hour=settings.gameplan_hour_utc, minute=(settings.gameplan_minute_utc + 2) % 60),
+            name="daily_report",
+        )
+        updater.job_queue.run_daily(
+            scheduled_weekly_report,
+            time(hour=settings.gameplan_hour_utc, minute=(settings.gameplan_minute_utc + 4) % 60),
+            name="weekly_report",
         )

@@ -109,6 +109,10 @@ Those tables let the bot calculate:
 You can inspect the latest summary in Telegram with:
 - `/metrics`
 - `/metrics weekly`
+- `/report`
+- `/report weekly`
+- `/leaderboard`
+- `/leaderboard weekly session`
 
 For multi-bot setups:
 - use a unique `BOT_NAMESPACE` per bot if they share the same SQLite file

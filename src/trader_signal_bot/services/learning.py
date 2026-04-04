@@ -59,6 +59,8 @@ class LearningService:
                 self.model = json.loads(self.model_path.read_text(encoding="utf-8"))
             except Exception:
                 self.model = {"asset_class": {}, "asset_session": {}, "ticker": {}, "side": {}}
+        if self.sqlite_store is not None and (self.history.get("signals") or self.history.get("closures")):
+            self.sqlite_store.import_json_history(self.history)
 
     def _save_history(self) -> None:
         self.history_path.write_text(json.dumps(self.history, indent=2), encoding="utf-8")
@@ -339,6 +341,9 @@ class LearningService:
             "period_end": "",
             "total_trades": 0,
             "winning_trades": 0,
+            "losing_trades": 0,
+            "hits": 0,
+            "misses": 0,
             "win_rate": 0.0,
             "total_pnl": 0.0,
             "roi": 0.0,
@@ -347,6 +352,11 @@ class LearningService:
             "profit_factor": 0.0,
             "expectancy": 0.0,
         }
+
+    def leaderboard(self, period_type: str = "weekly", group_by: str = "ticker", limit: int = 5) -> list[dict[str, Any]]:
+        if self.sqlite_store is not None:
+            return self.sqlite_store.leaderboard(period_type=period_type, group_by=group_by, limit=limit)
+        return []
 
     def dashboard(self, ticker: str) -> dict[str, Any]:
         normalized = ticker.upper()

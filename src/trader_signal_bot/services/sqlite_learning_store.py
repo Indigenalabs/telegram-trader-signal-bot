@@ -355,6 +355,9 @@ class SQLiteLearningStore:
                 "period_end": "",
                 "total_trades": 0,
                 "winning_trades": 0,
+                "losing_trades": 0,
+                "hits": 0,
+                "misses": 0,
                 "win_rate": 0.0,
                 "total_pnl": 0.0,
                 "roi": 0.0,
@@ -363,4 +366,225 @@ class SQLiteLearningStore:
                 "profit_factor": 0.0,
                 "expectancy": 0.0,
             }
-        return dict(row)
+        payload = dict(row)
+        losing_trades = max(0, int(payload["total_trades"]) - int(payload["winning_trades"]))
+        payload["losing_trades"] = losing_trades
+        payload["hits"] = int(payload["winning_trades"])
+        payload["misses"] = losing_trades
+        return payload
+
+    def leaderboard(self, period_type: str = "weekly", group_by: str = "ticker", limit: int = 5) -> list[dict[str, Any]]:
+        group_map = {
+            "ticker": "ticker",
+            "session": "market_session",
+            "asset": "asset_class",
+        }
+        group_column = group_map.get(group_by, "ticker")
+        start, end = self._period_bounds(period_type)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT {group_column} AS label,
+                       COUNT(*) AS total_trades,
+                       SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) AS winning_trades,
+                       AVG(COALESCE(return_pct, 0)) AS avg_return_pct,
+                       AVG(COALESCE(r_multiple, 0)) AS avg_r,
+                       SUM(COALESCE(profit_loss, 0)) AS total_pnl
+                FROM {self._trades_table}
+                WHERE status = 'CLOSED'
+                  AND exit_time >= ?
+                  AND exit_time < ?
+                GROUP BY {group_column}
+                HAVING COUNT(*) > 0
+                ORDER BY AVG(COALESCE(r_multiple, 0)) DESC, SUM(COALESCE(profit_loss, 0)) DESC
+                LIMIT ?
+                """,
+                (start.isoformat(), end.isoformat(), limit),
+            ).fetchall()
+        leaderboard: list[dict[str, Any]] = []
+        for row in rows:
+            total = int(row["total_trades"] or 0)
+            wins = int(row["winning_trades"] or 0)
+            leaderboard.append(
+                {
+                    "label": row["label"],
+                    "total_trades": total,
+                    "winning_trades": wins,
+                    "losing_trades": max(0, total - wins),
+                    "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+                    "avg_return_pct": round(float(row["avg_return_pct"] or 0.0), 2),
+                    "avg_r": round(float(row["avg_r"] or 0.0), 2),
+                    "total_pnl": round(float(row["total_pnl"] or 0.0), 2),
+                }
+            )
+        return leaderboard
+
+    def import_json_history(self, history: dict[str, list[dict[str, Any]]]) -> None:
+        for signal_event in history.get("signals", []):
+            signal_id = str(signal_event.get("trade_id", ""))
+            if not signal_id:
+                continue
+            scores = signal_event.get("scores", {}) or {}
+            entry_low = float(signal_event.get("entry_low", 0.0) or 0.0)
+            entry_high = float(signal_event.get("entry_high", 0.0) or 0.0)
+            metadata = {
+                "trade_id": signal_id,
+                "chat_id": signal_event.get("chat_id"),
+                "stop_loss": signal_event.get("stop_loss"),
+                "take_profit_1": signal_event.get("take_profit_1"),
+                "take_profit_2": signal_event.get("take_profit_2"),
+                "opened_at": signal_event.get("opened_at"),
+                "migrated": True,
+            }
+            with self._lock:
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {self._signals_table} (
+                        signal_id, timestamp, source_bot, wallet_address, transaction_hash, token_address,
+                        ticker, asset_class, amount_usd, signal_type, side, confidence, edge_score,
+                        confluence_count, signal_quality, market_session, scores_json, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(signal_id) DO NOTHING
+                    """,
+                    (
+                        signal_id,
+                        str(signal_event.get("opened_at") or signal_event.get("timestamp") or ""),
+                        self.namespace,
+                        signal_event.get("wallet_address"),
+                        signal_event.get("transaction_hash"),
+                        signal_event.get("token_address"),
+                        str(signal_event.get("ticker", "")),
+                        str(signal_event.get("asset_class", "")),
+                        signal_event.get("amount_usd"),
+                        str(signal_event.get("stage", signal_event.get("signal_type", "SIGNAL"))),
+                        str(signal_event.get("side", "")),
+                        int(signal_event.get("confidence", 0) or 0),
+                        int(scores.get("edge_score", 0) or 0),
+                        int(scores.get("confluence_count", 0) or 0),
+                        str(signal_event.get("signal_quality", "watchlist")),
+                        str(signal_event.get("market_session", "")),
+                        json.dumps(scores),
+                        json.dumps(metadata),
+                    ),
+                )
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {self._trades_table} (
+                        signal_id, wallet_address, token_address, ticker, asset_class, action, entry_price,
+                        exit_price, position_size, entry_time, exit_time, status, profit_loss, return_pct,
+                        r_multiple, confidence, edge_score, signal_quality, market_session, win, source_bot, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(signal_id) DO NOTHING
+                    """,
+                    (
+                        signal_id,
+                        signal_event.get("wallet_address"),
+                        signal_event.get("token_address"),
+                        str(signal_event.get("ticker", "")),
+                        str(signal_event.get("asset_class", "")),
+                        str(signal_event.get("side", "")),
+                        round((entry_low + entry_high) / 2, 4) if entry_low or entry_high else signal_event.get("entry_price"),
+                        None,
+                        signal_event.get("position_size"),
+                        str(signal_event.get("opened_at") or ""),
+                        None,
+                        "OPEN",
+                        None,
+                        None,
+                        None,
+                        int(signal_event.get("confidence", 0) or 0),
+                        int(scores.get("edge_score", 0) or 0),
+                        str(signal_event.get("signal_quality", "watchlist")),
+                        str(signal_event.get("market_session", "")),
+                        None,
+                        self.namespace,
+                        json.dumps(metadata),
+                    ),
+                )
+
+        for closure in history.get("closures", []):
+            signal_id = str(closure.get("trade_id", ""))
+            if not signal_id:
+                continue
+            metadata = {
+                "trade_id": signal_id,
+                "close_reason": closure.get("outcome"),
+                "migrated": True,
+            }
+            outcome = str(closure.get("outcome", ""))
+            with self._lock:
+                self._conn.execute(
+                    f"""
+                    UPDATE {self._trades_table}
+                    SET exit_price = COALESCE(?, exit_price),
+                        exit_time = COALESCE(?, exit_time),
+                        status = 'CLOSED',
+                        profit_loss = ?,
+                        return_pct = ?,
+                        r_multiple = ?,
+                        confidence = ?,
+                        signal_quality = ?,
+                        market_session = ?,
+                        win = ?,
+                        metadata_json = ?
+                    WHERE signal_id = ?
+                    """,
+                    (
+                        closure.get("close_price"),
+                        str(closure.get("closed_at") or ""),
+                        closure.get("dollar_pnl"),
+                        closure.get("return_pct"),
+                        closure.get("r_multiple"),
+                        int(closure.get("confidence", 0) or 0),
+                        str(closure.get("signal_quality", "watchlist")),
+                        str(closure.get("market_session", "")),
+                        1 if outcome == TradeStage.CLOSED_SUCCESS.value else 0,
+                        json.dumps(metadata),
+                        signal_id,
+                    ),
+                )
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {self._signals_table} (
+                        signal_id, timestamp, source_bot, wallet_address, transaction_hash, token_address,
+                        ticker, asset_class, amount_usd, signal_type, side, confidence, edge_score,
+                        confluence_count, signal_quality, market_session, scores_json, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(signal_id) DO NOTHING
+                    """,
+                    (
+                        signal_id,
+                        str(closure.get("opened_at") or closure.get("closed_at") or ""),
+                        self.namespace,
+                        closure.get("wallet_address"),
+                        closure.get("transaction_hash"),
+                        closure.get("token_address"),
+                        str(closure.get("ticker", "")),
+                        str(closure.get("asset_class", "")),
+                        closure.get("amount_usd"),
+                        outcome,
+                        str(closure.get("side", "")),
+                        int(closure.get("confidence", 0) or 0),
+                        0,
+                        0,
+                        str(closure.get("signal_quality", "watchlist")),
+                        str(closure.get("market_session", "")),
+                        json.dumps(closure.get("scores", {}) or {}),
+                        json.dumps(metadata),
+                    ),
+                )
+            self._conn.commit()
+        self.refresh_performance_metrics()
+
+    def _period_bounds(self, period_type: str) -> tuple[datetime, datetime]:
+        now = datetime.now(timezone.utc)
+        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        if period_type == "weekly":
+            start = start - timedelta(days=start.weekday())
+            end = start + timedelta(days=7)
+        else:
+            end = start + timedelta(days=1)
+        return start, end

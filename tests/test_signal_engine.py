@@ -254,9 +254,83 @@ class AnalysisTests(unittest.TestCase):
             metrics = learning.metrics_summary("daily")
             self.assertEqual(metrics["total_trades"], 2)
             self.assertEqual(metrics["winning_trades"], 2)
+            self.assertEqual(metrics["hits"], 2)
+            self.assertEqual(metrics["misses"], 0)
             self.assertGreater(metrics["profit_factor"], 0.0)
             self.assertGreater(metrics["expectancy"], 0.0)
+            leaderboard = learning.leaderboard("daily", "ticker", limit=5)
+            self.assertEqual(leaderboard[0]["label"], "SOL-USD")
+            self.assertEqual(leaderboard[0]["winning_trades"], 2)
             learning.close()
+
+    def test_learning_service_migrates_json_history_into_sqlite(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            history_path = f"{temp_dir}/migrate_bot_trade_history.json"
+            opened_at = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            closed_at = opened_at.replace(hour=3)
+            history_payload = {
+                "signals": [
+                    {
+                        "trade_id": "trade-1",
+                        "chat_id": 1,
+                        "ticker": "BTC-USD",
+                        "asset_class": "crypto",
+                        "side": "LONG",
+                        "stage": "SIGNAL",
+                        "entry_low": 99.0,
+                        "entry_high": 101.0,
+                        "stop_loss": 95.0,
+                        "take_profit_1": 108.0,
+                        "take_profit_2": 112.0,
+                        "confidence": 68,
+                        "market_session": "24/7 crypto market",
+                        "signal_quality": "high",
+                        "scores": {"technical": 70.0, "edge_score": 80, "confluence_count": 4},
+                        "opened_at": opened_at.isoformat(),
+                    }
+                ],
+                "closures": [
+                    {
+                        "trade_id": "trade-1",
+                        "chat_id": 1,
+                        "ticker": "BTC-USD",
+                        "asset_class": "crypto",
+                        "side": "LONG",
+                        "market_session": "24/7 crypto market",
+                        "signal_quality": "high",
+                        "confidence": 68,
+                        "scores": {"technical": 70.0},
+                        "opened_at": opened_at.isoformat(),
+                        "closed_at": closed_at.isoformat(),
+                        "outcome": "CLOSED_SUCCESS",
+                        "close_price": 109.0,
+                        "entry_price": 100.0,
+                        "return_pct": 9.0,
+                        "r_multiple": 1.8,
+                        "dollar_pnl": 9.0,
+                    }
+                ],
+            }
+            with open(history_path, "w", encoding="utf-8") as handle:
+                import json
+
+                json.dump(history_payload, handle)
+
+            learning = LearningService(
+                data_dir=temp_dir,
+                namespace="migrate_bot",
+                sqlite_database_path=f"{temp_dir}/learning.db",
+                min_sample_size=2,
+                max_confidence_adjustment=8,
+            )
+            try:
+                metrics = learning.metrics_summary("daily")
+                self.assertEqual(metrics["total_trades"], 1)
+                self.assertEqual(metrics["hits"], 1)
+                leaderboard = learning.leaderboard("daily", "ticker", limit=5)
+                self.assertEqual(leaderboard[0]["label"], "BTC-USD")
+            finally:
+                learning.close()
 
     def test_sqlite_state_store_persists_profiles_and_tracked_trades(self) -> None:
         with TemporaryDirectory() as temp_dir:
