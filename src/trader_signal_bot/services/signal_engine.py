@@ -165,29 +165,29 @@ class SignalEngine:
         if snapshot.asset_class.value in {"stock", "etf"}:
             stop_distance = max(stop_distance, current * 0.012)
             long_threshold = 62
-            short_threshold = 38
+            short_threshold = 44
             min_technical = 60
             min_risk = 58
         elif snapshot.asset_class.value == "forex":
             stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.0045)
             long_threshold = 60
-            short_threshold = 40
+            short_threshold = 44
             min_technical = 58
             min_risk = 55
         elif snapshot.asset_class.value == "futures":
             stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.01)
             long_threshold = 61
-            short_threshold = 39
+            short_threshold = 44
             min_technical = 59
             min_risk = 55
         elif snapshot.asset_class.value == "crypto":
             long_threshold = 63
-            short_threshold = 37
+            short_threshold = 44
             min_technical = 60
             min_risk = 52
         else:
             long_threshold = 60
-            short_threshold = 40
+            short_threshold = 44
             min_technical = 58
             min_risk = 55
 
@@ -224,7 +224,10 @@ class SignalEngine:
             take_profit_2 = current + (stop_distance * 1.2)
             rationale.insert(0, "Signal quality is mixed, so the engine is staying selective.")
 
-        confidence = round((weighted_score * 0.7) + (risk_score * 0.3))
+        if side == SignalSide.SHORT:
+            confidence = round(((100.0 - weighted_score) * 0.7) + (risk_score * 0.3))
+        else:
+            confidence = round((weighted_score * 0.7) + (risk_score * 0.3))
         base_confidence = max(0, min(confidence, 100))
         confluence_count = 0
         confluence_signals: list[str] = []

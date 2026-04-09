@@ -121,7 +121,7 @@ class Settings:
     }
     signal_min_confluence: int = int(os.getenv("SIGNAL_MIN_CONFLUENCE", "3"))
     high_quality_min_confluence: int = int(os.getenv("HIGH_QUALITY_MIN_CONFLUENCE", "4"))
-    edge_score_min_alert: int = int(os.getenv("EDGE_SCORE_MIN_ALERT", "60"))
+    edge_score_min_alert: int = int(os.getenv("EDGE_SCORE_MIN_ALERT", "55"))
     edge_score_min_high_quality: int = int(os.getenv("EDGE_SCORE_MIN_HIGH_QUALITY", "72"))
     learning_block_negative_edges: bool = os.getenv("LEARNING_BLOCK_NEGATIVE_EDGES", "true").strip().lower() in {
         "1",

@@ -204,10 +204,16 @@ def fundamental_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
         if 0.25 <= abs(day_change) <= 2.5:
             score += 4
             rationale.append("Price action is active without looking disorderly.")
+        elif day_change < -2.5:
+            score -= 12
+            rationale.append(f"Price is under significant selling pressure with a {day_change:.1f}% daily move.")
     elif snapshot.asset_class == AssetClass.CRYPTO:
         if day_change > 2:
             score += 6
             rationale.append("Crypto tape shows constructive daily expansion.")
+        elif day_change < -3:
+            score -= 6
+            rationale.append("Crypto tape shows significant selling pressure today.")
         rationale.append("On-chain factors are placeholder heuristics until premium feeds are added.")
     elif snapshot.asset_class == AssetClass.FOREX:
         if 0.2 <= abs(day_change) <= 1.0:
@@ -244,9 +250,17 @@ def sentiment_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     rationale: list[str] = []
     bucket = _asset_bucket(snapshot)
 
+    day_change_pct = float(snapshot.meta.get("day_change_pct", 0.0))
     if snapshot.asset_class == AssetClass.CRYPTO and volatility > 12:
-        score += 10
-        rationale.append("Crypto participation proxy is elevated from recent range expansion.")
+        if day_change_pct >= 0:
+            score += 10
+            rationale.append("Crypto participation proxy is elevated from recent range expansion.")
+        else:
+            score -= 10
+            rationale.append("High volatility with downside direction signals panic selling pressure in crypto.")
+    elif bucket == "stocks" and volatility > 6:
+        score -= 8
+        rationale.append("Elevated equity volatility signals fear and increased selling pressure.")
     elif bucket == "forex" and 0.6 <= volatility <= 2.5:
         score += 4
         rationale.append("FX participation proxy is healthy enough for cleaner directional moves.")
@@ -297,7 +311,7 @@ def macro_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
 def risk_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     prices = snapshot.history
     realized_range = _pct_change(max(prices[-14:]), min(prices[-14:])) if len(prices) >= 14 else 0.0
-    score = 70.0
+    score = 75.0
     rationale: list[str] = []
     bucket = _asset_bucket(snapshot)
     thresholds = {
