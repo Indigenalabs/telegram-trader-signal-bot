@@ -25,6 +25,7 @@ def _csv_env(name: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+# Primary universe: crypto (no PDT, 24/7, $5k friendly) + high-volume stocks for funded accounts.
 DEFAULT_TICKER_UNIVERSE = [
     "BTC-USD",
     "ETH-USD",
@@ -33,34 +34,22 @@ DEFAULT_TICKER_UNIVERSE = [
     "XRP-USD",
     "ADA-USD",
     "DOGE-USD",
-    "SPY",
-    "QQQ",
-    "DIA",
-    "IWM",
+    "AVAX-USD",
+    "LINK-USD",
+    "MATIC-USD",
+    "NVDA",
+    "TSLA",
     "AAPL",
     "MSFT",
-    "NVDA",
-    "AMZN",
     "META",
-    "GOOGL",
-    "TSLA",
-    "EURUSD=X",
-    "GBPUSD=X",
-    "USDJPY=X",
-    "AUDUSD=X",
-    "USDCAD=X",
-    "USDCHF=X",
-    "GC=F",
-    "SI=F",
-    "CL=F",
-    "BZ=F",
-    "NG=F",
-    "GLD",
-    "SLV",
+    "AMZN",
+    "SPY",
+    "QQQ",
 ]
 
 SCAN_PRESETS = {
-    "crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "DOGE-USD"],
+    "crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "AVAX-USD", "LINK-USD", "MATIC-USD"],
+    "majors": ["BTC-USD", "ETH-USD", "SOL-USD"],
     "stocks": ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "SPY", "QQQ", "DIA", "IWM"],
     "forex": ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X"],
     "metals": ["GC=F", "SI=F", "GLD", "SLV"],
@@ -91,6 +80,12 @@ class Settings:
         "LIVE_ALERT_HIGH_QUALITY_ONLY", "false"
     ).strip().lower() in {"1", "true", "yes", "on"}
     live_alert_ticker_limit: int = int(os.getenv("LIVE_ALERT_TICKER_LIMIT", "25"))
+    # Candle resolution: "1h" = day trading, "4h" = short swing, "1d" = swing
+    candle_interval: str = os.getenv("CANDLE_INTERVAL", "1h").strip().lower()
+    # Number of candles to fetch for history (100 x 1h = ~4 days of context)
+    candle_limit: int = int(os.getenv("CANDLE_LIMIT", "100"))
+    # Account size in USD — used for position sizing in signal messages
+    account_size_usd: float = float(os.getenv("ACCOUNT_SIZE_USD", "5000"))
     binance_api_key: str = os.getenv("BINANCE_API_KEY", "")
     newsapi_key: str = os.getenv("NEWSAPI_KEY", "")
     twelvedata_api_key: str = os.getenv("TWELVEDATA_API_KEY", "")

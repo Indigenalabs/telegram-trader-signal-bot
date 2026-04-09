@@ -40,8 +40,10 @@ def _to_binance_symbol(ticker: str) -> str | None:
 
 
 class BinanceMarketDataProvider(MarketDataProvider):
-    def __init__(self, api_key: str = "") -> None:
+    def __init__(self, api_key: str = "", interval: str = "1h", limit: int = 100) -> None:
         self.api_key = api_key
+        self.interval = interval
+        self.limit = limit
 
     def get_snapshot(self, ticker: str) -> PriceSnapshot:
         symbol = _to_binance_symbol(ticker)
@@ -60,21 +62,28 @@ class BinanceMarketDataProvider(MarketDataProvider):
 
         klines_response = requests.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": "1d", "limit": 60},
+            params={"symbol": symbol, "interval": self.interval, "limit": self.limit},
             headers=headers,
             timeout=20.0,
         )
         klines_response.raise_for_status()
         klines_payload = klines_response.json()
         closes = [float(item[4]) for item in klines_payload]
+        highs = [float(item[2]) for item in klines_payload]
+        lows = [float(item[3]) for item in klines_payload]
+        volumes = [float(item[5]) for item in klines_payload]
         if len(closes) < 2:
             raise ValueError(f"Insufficient Binance history returned for {ticker}")
 
         current_price = float(ticker_payload["lastPrice"])
-        previous_close = float(ticker_payload["prevClosePrice"])
-        high = float(ticker_payload["highPrice"])
-        low = float(ticker_payload["lowPrice"])
-        volume = float(ticker_payload["volume"])
+        previous_close = closes[-2] if len(closes) >= 2 else float(ticker_payload["prevClosePrice"])
+        # Use most recent candle high/low for intraday stop/TP calculations
+        high = highs[-1] if highs else float(ticker_payload["highPrice"])
+        low = lows[-1] if lows else float(ticker_payload["lowPrice"])
+        volume = volumes[-1] if volumes else float(ticker_payload["volume"])
+        # 24h change still useful for fundamental/sentiment analysis
+        open_24h = float(ticker_payload.get("openPrice", current_price))
+        day_change_pct = ((current_price - open_24h) / open_24h * 100) if open_24h else 0.0
 
         return PriceSnapshot(
             ticker=ticker.upper(),
@@ -85,15 +94,12 @@ class BinanceMarketDataProvider(MarketDataProvider):
             high=high,
             low=low,
             volume=volume,
-            history=closes[-60:],
+            history=closes,
             meta={
                 "exchange": "Binance",
                 "market_cap": None,
-                "day_change_pct": (
-                    ((current_price - previous_close) / previous_close) * 100
-                    if previous_close
-                    else 0.0
-                ),
+                "day_change_pct": round(day_change_pct, 4),
+                "candle_interval": self.interval,
                 "binance_symbol": symbol,
                 "requested_ticker": ticker.upper(),
                 "pricing_symbol": symbol,
@@ -103,8 +109,16 @@ class BinanceMarketDataProvider(MarketDataProvider):
 
 
 class TwelveDataMarketDataProvider(MarketDataProvider):
-    def __init__(self, api_key: str = "") -> None:
+    # Map our internal interval names to Twelve Data's format
+    _INTERVAL_MAP = {
+        "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
+        "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1day", "1w": "1week",
+    }
+
+    def __init__(self, api_key: str = "", interval: str = "1h", limit: int = 100) -> None:
         self.api_key = api_key
+        self.interval = interval
+        self.limit = limit
 
     def is_configured(self) -> bool:
         return bool(self.api_key)
@@ -113,12 +127,13 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
         if not self.api_key:
             raise ValueError("Twelve Data API key is not configured.")
 
+        td_interval = self._INTERVAL_MAP.get(self.interval, self.interval)
         response = requests.get(
             "https://api.twelvedata.com/time_series",
             params={
                 "symbol": ticker.upper(),
-                "interval": "1day",
-                "outputsize": 60,
+                "interval": td_interval,
+                "outputsize": self.limit,
                 "apikey": self.api_key,
             },
             timeout=20.0,
@@ -164,10 +179,28 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
 
 
 class YahooMarketDataProvider(MarketDataProvider):
+    # Yahoo Finance interval → (range, interval) params
+    _INTERVAL_CONFIG = {
+        "1m":  ("1d",  "1m"),
+        "5m":  ("5d",  "5m"),
+        "15m": ("5d",  "15m"),
+        "30m": ("5d",  "30m"),
+        "1h":  ("7d",  "60m"),
+        "2h":  ("60d", "60m"),   # Yahoo max intraday is 60m; use 60m with longer range
+        "4h":  ("60d", "60m"),
+        "1d":  ("3mo", "1d"),
+        "1w":  ("2y",  "1wk"),
+    }
+
+    def __init__(self, interval: str = "1h", limit: int = 100) -> None:
+        self.interval = interval
+        self.limit = limit
+
     def get_snapshot(self, ticker: str) -> PriceSnapshot:
+        range_str, yf_interval = self._INTERVAL_CONFIG.get(self.interval, ("7d", "60m"))
         url = (
             f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(ticker)}"
-            "?range=3mo&interval=1d&includePrePost=false&events=div%2Csplits"
+            f"?range={range_str}&interval={yf_interval}&includePrePost=false&events=div%2Csplits"
         )
         response = requests.get(
             url,
@@ -227,10 +260,12 @@ class CompositeMarketDataProvider(MarketDataProvider):
         binance_provider: BinanceMarketDataProvider,
         yahoo_provider: YahooMarketDataProvider,
         twelvedata_provider: TwelveDataMarketDataProvider | None = None,
+        interval: str = "1h",
     ) -> None:
         self.binance_provider = binance_provider
         self.yahoo_provider = yahoo_provider
         self.twelvedata_provider = twelvedata_provider
+        self.interval = interval
 
     def get_snapshot(self, ticker: str) -> PriceSnapshot:
         asset_class = classify_ticker(ticker)

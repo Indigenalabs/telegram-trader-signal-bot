@@ -132,6 +132,8 @@ class SignalEngine:
 
     def analyze(self, ticker: str) -> tuple[PriceSnapshot, dict[str, object]]:
         snapshot = self.provider.get_snapshot(ticker)
+        # Inject candle_interval from settings so analysis functions can scale thresholds
+        snapshot.meta.setdefault("candle_interval", self.settings.candle_interval)
         analyses = {
             "technical": technical_analysis(snapshot),
             "fundamental": fundamental_analysis(snapshot),
@@ -159,28 +161,45 @@ class SignalEngine:
         risk_score = analyses["risk"].score
         macro_score = analyses["macro"].score
         current = snapshot.current_price
-        stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.015)
+        candle_interval = self.settings.candle_interval
+
+        # Stop distance scales with candle resolution — intraday needs tighter stops
+        _stop_scale = {
+            "1m": 0.12, "5m": 0.18, "15m": 0.25, "30m": 0.35,
+            "1h": 0.45, "2h": 0.60, "4h": 0.75, "1d": 1.0, "1w": 1.5,
+        }
+        stop_scale = _stop_scale.get(candle_interval, 1.0)
+
+        # Timeframe label shown in signal messages
+        _timeframe_labels = {
+            "1m": "5-20 minutes", "5m": "15-60 minutes", "15m": "30-120 minutes",
+            "30m": "1-3 hours", "1h": "2-8 hours", "2h": "4-12 hours",
+            "4h": "8-24 hours", "1d": "2-5 days", "1w": "1-3 weeks",
+        }
+
+        stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.015 * stop_scale)
         market_session = market_session_label(snapshot)
 
         if snapshot.asset_class.value in {"stock", "etf"}:
-            stop_distance = max(stop_distance, current * 0.012)
+            stop_distance = max(stop_distance, current * 0.012 * stop_scale)
             long_threshold = 62
             short_threshold = 44
             min_technical = 60
             min_risk = 58
         elif snapshot.asset_class.value == "forex":
-            stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.0045)
+            stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.0045 * stop_scale)
             long_threshold = 60
             short_threshold = 44
             min_technical = 58
             min_risk = 55
         elif snapshot.asset_class.value == "futures":
-            stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.01)
+            stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.01 * stop_scale)
             long_threshold = 61
             short_threshold = 44
             min_technical = 59
             min_risk = 55
         elif snapshot.asset_class.value == "crypto":
+            stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.012 * stop_scale)
             long_threshold = 63
             short_threshold = 44
             min_technical = 60
@@ -240,14 +259,14 @@ class SignalEngine:
             )
         signal_quality = "watchlist"
 
-        if snapshot.asset_class.value in {"stock", "etf"}:
-            timeframe = "2-7 days"
-        elif snapshot.asset_class.value == "forex":
-            timeframe = "1-4 days"
-        elif snapshot.asset_class.value == "futures":
-            timeframe = "1-5 days"
-        else:
-            timeframe = "2-5 days"
+        timeframe = _timeframe_labels.get(candle_interval, "2-8 hours")
+        # Trade type label shown in signal message header
+        _trade_type_labels = {
+            "1m": "SCALP", "5m": "SCALP", "15m": "DAY TRADE",
+            "30m": "DAY TRADE", "1h": "DAY TRADE", "2h": "DAY TRADE",
+            "4h": "SWING", "1d": "SWING", "1w": "LONG PLAY",
+        }
+        trade_type = _trade_type_labels.get(candle_interval, "DAY TRADE")
 
         signal = Signal(
             ticker=snapshot.ticker,
@@ -271,6 +290,7 @@ class SignalEngine:
             pricing_currency=snapshot.currency,
             market_session=market_session,
             signal_quality=signal_quality,
+            trade_type=trade_type,
         )
         if self.learning_service is not None:
             signal = self.learning_service.apply_to_signal(signal)

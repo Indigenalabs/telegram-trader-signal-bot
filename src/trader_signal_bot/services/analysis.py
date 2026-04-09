@@ -124,15 +124,22 @@ def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
         if recent_high != recent_low
         else 0.5
     )
-    momentum_thresholds = {
-        "crypto": 3.0,
-        "stocks": 1.8,
-        "forex": 0.45,
-        "metals": 1.0,
-        "energy": 1.6,
-        "futures": 1.2,
+    # Momentum thresholds scale with candle interval — hourly moves are ~12x smaller than daily
+    candle_interval = str(snapshot.meta.get("candle_interval", "1d"))
+    _intraday_scale = {
+        "1m": 0.04, "5m": 0.08, "15m": 0.12, "30m": 0.18,
+        "1h": 0.25, "2h": 0.35, "4h": 0.55, "1d": 1.0, "1w": 2.5,
     }
-    threshold = momentum_thresholds.get(bucket, 1.5)
+    scale = _intraday_scale.get(candle_interval, 1.0)
+    momentum_thresholds = {
+        "crypto": 3.0 * scale,
+        "stocks": 1.8 * scale,
+        "forex": 0.45 * scale,
+        "metals": 1.0 * scale,
+        "energy": 1.6 * scale,
+        "futures": 1.2 * scale,
+    }
+    threshold = momentum_thresholds.get(bucket, 1.5 * scale)
 
     score = 50.0
     rationale: list[str] = []
@@ -250,24 +257,30 @@ def sentiment_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     rationale: list[str] = []
     bucket = _asset_bucket(snapshot)
 
+    candle_interval_sent = str(snapshot.meta.get("candle_interval", "1d"))
+    _sent_scale = {
+        "1m": 0.04, "5m": 0.08, "15m": 0.12, "30m": 0.18,
+        "1h": 0.25, "2h": 0.35, "4h": 0.55, "1d": 1.0, "1w": 2.5,
+    }
+    sent_scale = _sent_scale.get(candle_interval_sent, 1.0)
     day_change_pct = float(snapshot.meta.get("day_change_pct", 0.0))
-    if snapshot.asset_class == AssetClass.CRYPTO and volatility > 12:
+    if snapshot.asset_class == AssetClass.CRYPTO and volatility > 12 * sent_scale:
         if day_change_pct >= 0:
             score += 10
             rationale.append("Crypto participation proxy is elevated from recent range expansion.")
         else:
             score -= 10
             rationale.append("High volatility with downside direction signals panic selling pressure in crypto.")
-    elif bucket == "stocks" and volatility > 6:
+    elif bucket == "stocks" and volatility > 6 * sent_scale:
         score -= 8
         rationale.append("Elevated equity volatility signals fear and increased selling pressure.")
-    elif bucket == "forex" and 0.6 <= volatility <= 2.5:
+    elif bucket == "forex" and 0.6 * sent_scale <= volatility <= 2.5 * sent_scale:
         score += 4
         rationale.append("FX participation proxy is healthy enough for cleaner directional moves.")
-    elif bucket in {"metals", "energy"} and volatility >= 4:
+    elif bucket in {"metals", "energy"} and volatility >= 4 * sent_scale:
         score += 4
         rationale.append("Commodity volatility is active enough to create follow-through if direction is clean.")
-    elif volatility < 4:
+    elif volatility < 4 * sent_scale:
         score -= 5
         rationale.append("Compressed recent range suggests muted attention and weaker follow-through.")
     else:
@@ -314,15 +327,21 @@ def risk_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     score = 75.0
     rationale: list[str] = []
     bucket = _asset_bucket(snapshot)
-    thresholds = {
-        "crypto": (18, 10),
-        "stocks": (12, 7),
-        "forex": (3.0, 1.6),
-        "metals": (8, 4),
-        "energy": (12, 7),
-        "futures": (10, 5),
+    candle_interval_risk = str(snapshot.meta.get("candle_interval", "1d"))
+    _risk_scale = {
+        "1m": 0.04, "5m": 0.08, "15m": 0.12, "30m": 0.18,
+        "1h": 0.25, "2h": 0.35, "4h": 0.55, "1d": 1.0, "1w": 2.5,
     }
-    high_threshold, mid_threshold = thresholds.get(bucket, (10, 5))
+    risk_scale = _risk_scale.get(candle_interval_risk, 1.0)
+    thresholds = {
+        "crypto": (18 * risk_scale, 10 * risk_scale),
+        "stocks": (12 * risk_scale, 7 * risk_scale),
+        "forex": (3.0 * risk_scale, 1.6 * risk_scale),
+        "metals": (8 * risk_scale, 4 * risk_scale),
+        "energy": (12 * risk_scale, 7 * risk_scale),
+        "futures": (10 * risk_scale, 5 * risk_scale),
+    }
+    high_threshold, mid_threshold = thresholds.get(bucket, (10 * risk_scale, 5 * risk_scale))
 
     if realized_range > high_threshold:
         score -= 20

@@ -24,9 +24,21 @@ def main() -> None:
 
     updater = Updater(token=settings.telegram_bot_token, use_context=True)
     provider = CompositeMarketDataProvider(
-        binance_provider=BinanceMarketDataProvider(api_key=settings.binance_api_key),
-        yahoo_provider=YahooMarketDataProvider(),
-        twelvedata_provider=TwelveDataMarketDataProvider(api_key=settings.twelvedata_api_key),
+        binance_provider=BinanceMarketDataProvider(
+            api_key=settings.binance_api_key,
+            interval=settings.candle_interval,
+            limit=settings.candle_limit,
+        ),
+        yahoo_provider=YahooMarketDataProvider(
+            interval=settings.candle_interval,
+            limit=settings.candle_limit,
+        ),
+        twelvedata_provider=TwelveDataMarketDataProvider(
+            api_key=settings.twelvedata_api_key,
+            interval=settings.candle_interval,
+            limit=settings.candle_limit,
+        ),
+        interval=settings.candle_interval,
     )
     news_service = NewsService(api_key=settings.newsapi_key)
     learning_service = LearningService(

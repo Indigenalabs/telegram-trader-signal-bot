@@ -45,7 +45,31 @@ def _authorized(settings: Settings, chat_id: int) -> bool:
     return chat_id in settings.allowed_chat_ids
 
 
-def _signal_text(signal: Signal) -> str:
+def _position_size_line(signal: Signal, settings: Settings) -> str:
+    """Calculate position size based on account size and 1% risk rule."""
+    if signal.side == SignalSide.NEUTRAL:
+        return ""
+    try:
+        entry_price = (signal.entry_low + signal.entry_high) / 2
+        stop_distance = abs(entry_price - signal.stop_loss)
+        if stop_distance <= 0 or entry_price <= 0:
+            return ""
+        risk_amount = settings.account_size_usd * settings.default_risk_per_trade
+        units = risk_amount / stop_distance
+        position_value = units * entry_price
+        stop_pct = (stop_distance / entry_price) * 100
+        tp1_pct = (abs(signal.take_profit_1 - entry_price) / entry_price) * 100
+        rr = tp1_pct / stop_pct if stop_pct > 0 else 0
+        return (
+            f"💰 Size: {units:.4f} units (${position_value:.2f} notional)\n"
+            f"   Risk: ${risk_amount:.2f} ({settings.default_risk_per_trade:.0%} of ${settings.account_size_usd:,.0f}) "
+            f"| Stop: {stop_pct:.2f}% | R/R: 1:{rr:.1f}\n"
+        )
+    except Exception:
+        return ""
+
+
+def _signal_text(signal: Signal, settings: Settings | None = None) -> str:
     learning_line = (
         f"Learning: base {signal.base_confidence}% | adjustment {signal.learning_adjustment:+d} | "
         f"expectancy {signal.learned_expectancy:+.2f}R | support {signal.learned_sample_size}\n"
@@ -57,19 +81,21 @@ def _signal_text(signal: Signal) -> str:
         if signal.side != SignalSide.NEUTRAL
         else ""
     )
+    size_line = _position_size_line(signal, settings) if settings is not None else ""
+    trade_type = getattr(signal, "trade_type", "DAY TRADE")
+    type_icon = {"SCALP": "⚡", "DAY TRADE": "🔥", "SWING": "📊", "LONG PLAY": "🏹"}.get(trade_type, "📈")
     return (
-        f"📈 <b>{signal.side.value}</b> - {signal.ticker}\n"
-        f"Asset: {signal.asset_class.value}\n"
-        f"Quality: {signal.signal_quality}\n"
+        f"{type_icon} <b>{trade_type} — {signal.side.value}</b> - {signal.ticker}\n"
+        f"Asset: {signal.asset_class.value} | Quality: {signal.signal_quality}\n"
         f"Session: {signal.market_session}\n"
         f"Market: {signal.price_source} {signal.pricing_symbol} ({signal.pricing_currency})\n"
         f"Price now: {signal.current_price}\n"
         f"Entry: {signal.entry_low} to {signal.entry_high}\n"
         f"Stop: {signal.stop_loss}\n"
-        f"TP1: {signal.take_profit_1}\n"
-        f"TP2: {signal.take_profit_2}\n"
+        f"TP1: {signal.take_profit_1} | TP2: {signal.take_profit_2}\n"
         f"Confidence: {signal.confidence}%\n"
         f"{edge_line}"
+        f"{size_line}"
         f"{learning_line}"
         f"Timeframe: {signal.timeframe}\n"
         f"Rationale:\n- " + "\n- ".join(signal.rationale[:4]) + "\n\n"
@@ -198,13 +224,13 @@ def _trade_close_metrics(
     }
 
 
-def _arming_text(signal: Signal) -> str:
-    return "🟡 <b>ARMING</b> - get ready\n" + _signal_text(signal)
+def _arming_text(signal: Signal, settings: Settings | None = None) -> str:
+    return "🟡 <b>ARMING</b> - get ready\n" + _signal_text(signal, settings=settings)
 
 
-def _signal_live_text(signal: Signal) -> str:
+def _signal_live_text(signal: Signal, settings: Settings | None = None) -> str:
     action_label = "buy now" if signal.side == SignalSide.LONG else "sell now"
-    return f"🚨 <b>SIGNAL</b> - {action_label}\n" + _signal_text(signal)
+    return f"🚨 <b>SIGNAL</b> - {action_label}\n" + _signal_text(signal, settings=settings)
 
 
 def _closed_trade_text(
@@ -276,7 +302,7 @@ def _expired_signal_text(
     )
 
 
-def _gameplan_text(gameplan: Gameplan, learning_summary: dict | None = None) -> str:
+def _gameplan_text(gameplan: Gameplan, learning_summary: dict | None = None, settings: Settings | None = None) -> str:
     actionable = [item for item in gameplan.top_trades if item.side != SignalSide.NEUTRAL][:3]
     watchable = [item for item in gameplan.top_trades if item.side == SignalSide.NEUTRAL and item.edge_score > 0][:3]
 
@@ -304,7 +330,7 @@ def _gameplan_text(gameplan: Gameplan, learning_summary: dict | None = None) -> 
             f"{stats_line}"
         )
 
-    signal_blocks = ["🚨 <b>Signal Setup</b>\n" + _signal_text(item) for item in actionable]
+    signal_blocks = ["🚨 <b>Signal Setup</b>\n" + _signal_text(item, settings=settings) for item in actionable]
     return (
         f"📬 <b>Daily Signal Digest</b> - {gameplan.generated_for}\n"
         f"Market note: {gameplan.macro_oracle[0]}\n\n"
@@ -424,7 +450,7 @@ def build_handlers(
         ticker = context.args[0] if context.args else settings.default_tickers[0]
         try:
             signal = engine.generate_signal(ticker)
-            guarded_reply(update, _signal_text(signal))
+            guarded_reply(update, _signal_text(signal, settings=settings))
         except Exception as exc:
             guarded_reply(update, f"Could not generate a signal for {ticker}: {exc}")
 
@@ -452,7 +478,7 @@ def build_handlers(
         tickers = profile.watchlist or settings.default_tickers
         plan = engine.generate_gameplan(tickers)
         summary = learning_service.metrics_summary("daily") if learning_service is not None else None
-        guarded_reply(update, _gameplan_text(plan, learning_summary=summary))
+        guarded_reply(update, _gameplan_text(plan, learning_summary=summary, settings=settings))
 
     def scan(update: Update, context: CallbackContext) -> None:
         chat_id = update.effective_chat.id if update.effective_chat else 0
@@ -726,7 +752,7 @@ def build_handlers(
             return
         plan = engine.generate_gameplan(settings.default_tickers)
         summary = learning_service.metrics_summary("daily") if learning_service is not None else None
-        text = _gameplan_text(plan, learning_summary=summary)
+        text = _gameplan_text(plan, learning_summary=summary, settings=settings)
         for chat_id in chat_ids:
             context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
 
@@ -921,7 +947,7 @@ def build_handlers(
                     if state.should_send_alert(chat_id, signal.ticker, TradeStage.SIGNAL.value, signal.confidence):
                         context.bot.send_message(
                             chat_id=chat_id,
-                            text=_signal_live_text(signal),
+                            text=_signal_live_text(signal, settings=settings),
                             parse_mode=ParseMode.HTML,
                         )
                         if hasattr(state, "log_alert"):
@@ -941,7 +967,7 @@ def build_handlers(
                 if state.should_send_alert(chat_id, signal.ticker, TradeStage.ARMING.value, signal.confidence):
                     context.bot.send_message(
                         chat_id=chat_id,
-                        text=_arming_text(signal),
+                        text=_arming_text(signal, settings=settings),
                         parse_mode=ParseMode.HTML,
                     )
 

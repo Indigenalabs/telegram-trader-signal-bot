@@ -80,6 +80,7 @@ class Signal:
     pricing_currency: str = ""
     market_session: str = ""
     signal_quality: str = "standard"
+    trade_type: str = "DAY TRADE"
     disclaimer: str = "Not financial advice. Trading involves risk of loss."
 
 
