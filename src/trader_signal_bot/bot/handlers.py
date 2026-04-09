@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+import re
+from datetime import datetime, time, timedelta, timezone
 from uuid import uuid4
 
 from telegram import ParseMode, Update
@@ -103,6 +104,14 @@ def _is_strong_signal(signal: Signal, settings: Settings) -> bool:
     return True
 
 
+def _signal_expires_at(signal: Signal) -> str:
+    """Parse the signal timeframe string and return an ISO expiry timestamp."""
+    timeframe = signal.timeframe
+    match = re.search(r"(\d+)", timeframe.split("-")[-1] if "-" in timeframe else timeframe)
+    days = int(match.group(1)) if match else 7
+    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+
 def _build_tracked_trade(
     chat_id: int,
     signal: Signal,
@@ -131,6 +140,7 @@ def _build_tracked_trade(
         signal_quality=signal.signal_quality,
         scores=scores,
         opened_at=datetime.now(timezone.utc).isoformat(),
+        expires_at=_signal_expires_at(signal),
     )
 
 
@@ -237,13 +247,61 @@ def _closed_trade_text(
     )
 
 
-def _gameplan_text(gameplan: Gameplan) -> str:
+def _expired_signal_text(
+    trade: TrackedTrade,
+    signal: Signal,
+    outcome: TradeStage,
+    metrics: dict,
+) -> str:
+    verdict = "SUCCESS" if outcome == TradeStage.CLOSED_SUCCESS else "FAILURE"
+    icon = "✅" if outcome == TradeStage.CLOSED_SUCCESS else "❌"
+    r = metrics.get("r_multiple", 0.0) or 0.0
+    ret = metrics.get("return_pct", 0.0) or 0.0
+    pnl_line = (
+        f"Estimated P/L per unit: {round(signal.current_price - metrics['entry_price'], 4) if trade.side == SignalSide.LONG else round(metrics['entry_price'] - signal.current_price, 4)}\n"
+    )
+    return (
+        f"{icon} <b>SIGNAL EXPIRED</b> - {verdict}\n"
+        f"Ticker: {trade.ticker}\n"
+        f"Direction: {trade.side.value}\n"
+        f"Opened: {trade.opened_at[:10]}\n"
+        f"Entry zone: {trade.entry_low} – {trade.entry_high}\n"
+        f"Assumed fill: {metrics['entry_price']}\n"
+        f"Stop: {trade.stop_loss} | TP1: {trade.take_profit_1} | TP2: {trade.take_profit_2}\n"
+        f"Exit price: {signal.current_price}\n"
+        f"Return: {ret}% | R: {r}R\n"
+        f"{pnl_line}"
+        f"Result: Timeframe elapsed — signal closed at market.\n"
+        f"<i>This outcome has been recorded for the learning model.</i>"
+    )
+
+
+def _gameplan_text(gameplan: Gameplan, learning_summary: dict | None = None) -> str:
     actionable = [item for item in gameplan.top_trades if item.side != SignalSide.NEUTRAL][:3]
+    watchable = [item for item in gameplan.top_trades if item.side == SignalSide.NEUTRAL and item.edge_score > 0][:3]
+
+    stats_line = ""
+    if learning_summary and learning_summary.get("total_trades", 0) > 0:
+        stats_line = (
+            f"\n📈 Bot stats: {learning_summary['total_trades']} closed signals | "
+            f"win rate {learning_summary.get('win_rate', 0)}% | "
+            f"avg R {learning_summary.get('avg_r', 0)}"
+        )
+
     if not actionable:
+        watch_lines = ""
+        if watchable:
+            watch_lines = "\n\n👀 <b>On Watch</b> (not yet tradable):\n" + "\n".join(
+                f"  • <b>{s.ticker}</b>: edge {s.edge_score} | conf {s.confidence}% | "
+                f"tech {s.scores.get('technical', 0):.0f} | risk {s.scores.get('risk', 0):.0f} | {s.market_session}"
+                for s in watchable
+            )
         return (
             f"📬 <b>Daily Signal Digest</b> - {gameplan.generated_for}\n"
             f"No strong actionable setups right now.\n"
             f"Market note: {gameplan.macro_oracle[0]}"
+            f"{watch_lines}"
+            f"{stats_line}"
         )
 
     signal_blocks = ["🚨 <b>Signal Setup</b>\n" + _signal_text(item) for item in actionable]
@@ -251,6 +309,7 @@ def _gameplan_text(gameplan: Gameplan) -> str:
         f"📬 <b>Daily Signal Digest</b> - {gameplan.generated_for}\n"
         f"Market note: {gameplan.macro_oracle[0]}\n\n"
         + "\n\n".join(signal_blocks)
+        + stats_line
     )
 
 
@@ -319,7 +378,7 @@ def build_handlers(
             update,
             (
                 f"<b>{settings.bot_name}</b>\n"
-                "Commands: /signals <ticker>, /scan [tickers|preset], /analyze <ticker>, /news <ticker>, /gameplan, /watchlist, "
+                "Commands: /signals <ticker>, /scan [tickers|preset], /analyze <ticker>, /news <ticker>, /gameplan, /pending, /watchlist, "
                 "/portfolio, /risk, /settings, /mychatid, /alerts, /stats, /model, /dashboard, /metrics, /report, /leaderboard\n\n"
                 "Presets: crypto, stocks, forex, metals, energy, futures\n\n"
                 "This bot is for research and informational use only."
@@ -392,7 +451,8 @@ def build_handlers(
         profile = state.get_profile(chat_id)
         tickers = profile.watchlist or settings.default_tickers
         plan = engine.generate_gameplan(tickers)
-        guarded_reply(update, _gameplan_text(plan))
+        summary = learning_service.metrics_summary("daily") if learning_service is not None else None
+        guarded_reply(update, _gameplan_text(plan, learning_summary=summary))
 
     def scan(update: Update, context: CallbackContext) -> None:
         chat_id = update.effective_chat.id if update.effective_chat else 0
@@ -665,7 +725,8 @@ def build_handlers(
         if not chat_ids:
             return
         plan = engine.generate_gameplan(settings.default_tickers)
-        text = _gameplan_text(plan)
+        summary = learning_service.metrics_summary("daily") if learning_service is not None else None
+        text = _gameplan_text(plan, learning_summary=summary)
         for chat_id in chat_ids:
             context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
 
@@ -742,6 +803,7 @@ def build_handlers(
                 tracked_trade = state.get_tracked_trade(chat_id, signal.ticker)
 
                 if tracked_trade is not None and tracked_trade.stage == TradeStage.SIGNAL:
+                    # Check TP/SL hit first
                     outcome, reason = _trade_close_outcome(tracked_trade, signal)
                     if outcome is not None:
                         entry_reference, position_size = _tracked_position_entry_and_size(profile, signal.ticker)
@@ -773,6 +835,39 @@ def build_handlers(
                             )
                         state.clear_tracked_trade(chat_id, signal.ticker)
                         continue
+
+                    # Check if the signal has expired (timeframe elapsed, no TP/SL hit)
+                    if tracked_trade.expires_at:
+                        try:
+                            expires_dt = datetime.fromisoformat(tracked_trade.expires_at)
+                            if datetime.now(timezone.utc) >= expires_dt:
+                                entry_reference, position_size = _tracked_position_entry_and_size(profile, signal.ticker)
+                                close_metrics = _trade_close_metrics(
+                                    tracked_trade,
+                                    signal,
+                                    entry_reference=entry_reference,
+                                    position_size=position_size,
+                                )
+                                r_multiple = float(close_metrics.get("r_multiple") or 0.0)
+                                expiry_outcome = (
+                                    TradeStage.CLOSED_SUCCESS if r_multiple > 0 else TradeStage.CLOSED_FAILURE
+                                )
+                                context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=_expired_signal_text(tracked_trade, signal, expiry_outcome, close_metrics),
+                                    parse_mode=ParseMode.HTML,
+                                )
+                                if learning_service is not None:
+                                    learning_service.record_trade_close(
+                                        tracked_trade,
+                                        signal,
+                                        expiry_outcome,
+                                        close_metrics,
+                                    )
+                                state.clear_tracked_trade(chat_id, signal.ticker)
+                                continue
+                        except ValueError:
+                            pass
 
                 should_filter = False
                 reason = ""
@@ -850,6 +945,45 @@ def build_handlers(
                         parse_mode=ParseMode.HTML,
                     )
 
+    def pending_cmd(update: Update, context: CallbackContext) -> None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        profile = state.get_profile(chat_id)
+        tickers = profile.watchlist or settings.default_tickers
+        open_trades = [
+            state.get_tracked_trade(chat_id, ticker)
+            for ticker in tickers
+            if state.get_tracked_trade(chat_id, ticker) is not None
+        ]
+        if not open_trades:
+            guarded_reply(update, "📭 No open signals being tracked right now.")
+            return
+        lines = [f"📡 <b>Open Signals</b> ({len(open_trades)} tracked)"]
+        for trade in open_trades:
+            try:
+                signal = engine.generate_signal(trade.ticker)
+                metrics = _trade_close_metrics(trade, signal)
+                r = float(metrics.get("r_multiple") or 0.0)
+                ret = float(metrics.get("return_pct") or 0.0)
+                price_now = signal.current_price
+                r_icon = "🟢" if r > 0 else ("🔴" if r < 0 else "⚪")
+                expires_label = ""
+                if trade.expires_at:
+                    try:
+                        exp = datetime.fromisoformat(trade.expires_at)
+                        days_left = (exp - datetime.now(timezone.utc)).days
+                        expires_label = f" | expires in {max(0, days_left)}d"
+                    except ValueError:
+                        pass
+                lines.append(
+                    f"{r_icon} <b>{trade.ticker}</b> {trade.side.value} [{trade.stage.value}]\n"
+                    f"   Entry: {trade.entry_low}–{trade.entry_high} | Stop: {trade.stop_loss} | TP1: {trade.take_profit_1}\n"
+                    f"   Price now: {price_now} | R: {r:+.2f}R | Return: {ret:+.2f}%{expires_label}\n"
+                    f"   Conf: {trade.confidence}% | Quality: {trade.signal_quality}"
+                )
+            except Exception:
+                lines.append(f"⚪ <b>{trade.ticker}</b> {trade.side.value} — could not fetch live price")
+        guarded_reply(update, "\n".join(lines))
+
     dispatcher.add_handler(CommandHandler("start", start))
     dispatcher.add_handler(CommandHandler("mychatid", mychatid))
     dispatcher.add_handler(CommandHandler("alerts", alerts))
@@ -868,6 +1002,7 @@ def build_handlers(
     dispatcher.add_handler(CommandHandler("report", report_cmd))
     dispatcher.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     dispatcher.add_handler(CommandHandler("settings", settings_cmd))
+    dispatcher.add_handler(CommandHandler("pending", pending_cmd))
 
     if updater.job_queue is not None:
         updater.job_queue.run_daily(

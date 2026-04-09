@@ -88,7 +88,7 @@ class Settings:
     live_alert_min_confidence: int = int(os.getenv("LIVE_ALERT_MIN_CONFIDENCE", "58"))
     strong_play_min_confidence: int = int(os.getenv("STRONG_PLAY_MIN_CONFIDENCE", "66"))
     live_alert_high_quality_only: bool = os.getenv(
-        "LIVE_ALERT_HIGH_QUALITY_ONLY", "true"
+        "LIVE_ALERT_HIGH_QUALITY_ONLY", "false"
     ).strip().lower() in {"1", "true", "yes", "on"}
     live_alert_ticker_limit: int = int(os.getenv("LIVE_ALERT_TICKER_LIMIT", "25"))
     binance_api_key: str = os.getenv("BINANCE_API_KEY", "")

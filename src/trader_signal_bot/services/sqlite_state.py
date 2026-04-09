@@ -72,6 +72,7 @@ class SQLiteStateStore(UserStateStore):
                     signal_quality TEXT NOT NULL,
                     scores_json TEXT NOT NULL,
                     opened_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (chat_id, ticker)
                 );
 
@@ -88,6 +89,14 @@ class SQLiteStateStore(UserStateStore):
                 """
             )
             self._conn.commit()
+        # Migrate existing databases that predate the expires_at column
+        try:
+            self._conn.execute(
+                f"ALTER TABLE {self._tracked_trades_table} ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+        except Exception:
+            pass  # Column already exists
 
     def _load_profiles(self) -> None:
         with self._lock:
@@ -113,7 +122,7 @@ class SQLiteStateStore(UserStateStore):
                 f"""
                 SELECT chat_id, ticker, trade_id, asset_class, side, stage, entry_low, entry_high,
                        stop_loss, take_profit_1, take_profit_2, confidence, market_session,
-                       signal_quality, scores_json, opened_at
+                       signal_quality, scores_json, opened_at, expires_at
                 FROM {self._tracked_trades_table}
                 """
             ).fetchall()
@@ -135,6 +144,7 @@ class SQLiteStateStore(UserStateStore):
                 signal_quality=row["signal_quality"],
                 opened_at=row["opened_at"],
                 scores=json.loads(row["scores_json"] or "{}"),
+                expires_at=row["expires_at"] or "",
             )
             self._tracked_trades[(trade.chat_id, trade.ticker.upper())] = trade
 
@@ -177,9 +187,9 @@ class SQLiteStateStore(UserStateStore):
                 INSERT INTO {self._tracked_trades_table} (
                     chat_id, ticker, trade_id, asset_class, side, stage, entry_low, entry_high,
                     stop_loss, take_profit_1, take_profit_2, confidence, market_session,
-                    signal_quality, scores_json, opened_at
+                    signal_quality, scores_json, opened_at, expires_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, ticker) DO UPDATE SET
                     trade_id=excluded.trade_id,
                     asset_class=excluded.asset_class,
@@ -194,7 +204,8 @@ class SQLiteStateStore(UserStateStore):
                     market_session=excluded.market_session,
                     signal_quality=excluded.signal_quality,
                     scores_json=excluded.scores_json,
-                    opened_at=excluded.opened_at
+                    opened_at=excluded.opened_at,
+                    expires_at=excluded.expires_at
                 """,
                 (
                     trade.chat_id,
@@ -213,6 +224,7 @@ class SQLiteStateStore(UserStateStore):
                     trade.signal_quality,
                     json.dumps(trade.scores),
                     trade.opened_at,
+                    trade.expires_at,
                 ),
             )
             self._conn.commit()

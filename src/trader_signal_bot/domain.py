@@ -147,3 +147,4 @@ class TrackedTrade:
     signal_quality: str
     opened_at: str
     scores: dict[str, float] = field(default_factory=dict)
+    expires_at: str = ""
