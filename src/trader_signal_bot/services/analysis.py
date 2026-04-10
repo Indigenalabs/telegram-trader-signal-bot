@@ -43,6 +43,32 @@ def _atr(closes: list[float], highs: list[float], lows: list[float], period: int
     return mean(trs) if trs else 0.0
 
 
+def _macd(prices: list[float], fast: int = 12, slow: int = 26, signal_period: int = 9) -> tuple[float, float, float]:
+    """
+    Return (macd_line, signal_line, histogram).
+    Returns (0, 0, 0) when there is not enough history.
+    """
+    if len(prices) < slow + signal_period:
+        return 0.0, 0.0, 0.0
+    ema_fast = _ema(prices, fast)
+    ema_slow = _ema(prices, slow)
+    macd_line = ema_fast - ema_slow
+    # Approximate signal line as EMA of the last signal_period MACD values
+    # Build a short series of MACD values using a sliding window
+    macd_series: list[float] = []
+    for i in range(signal_period + 1):
+        idx = len(prices) - (signal_period - i)
+        if idx < slow:
+            macd_series.append(0.0)
+            continue
+        ef = _ema(prices[:idx], fast)
+        es = _ema(prices[:idx], slow)
+        macd_series.append(ef - es)
+    signal_line = _ema(macd_series, signal_period)
+    histogram = macd_line - signal_line
+    return round(macd_line, 6), round(signal_line, 6), round(histogram, 6)
+
+
 def _vwap(closes: list[float], highs: list[float], lows: list[float], volumes: list[float]) -> float:
     """Volume-weighted average price over available history."""
     n = min(len(closes), len(highs), len(lows), len(volumes))
@@ -175,6 +201,9 @@ def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     ema_9 = _ema(prices, 9)
     ema_21 = _ema(prices, 21)
 
+    # MACD (12, 26, 9)
+    macd_line, macd_signal, macd_hist = _macd(prices)
+
     # VWAP (uses full available history)
     vwap = 0.0
     has_vwap = bool(highs and lows and volumes)
@@ -234,6 +263,21 @@ def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     else:
         score -= 8
         rationale.append(f"EMA 9 is below EMA 21 ({ema_9:.4f} vs {ema_21:.4f}), confirming bearish short-term momentum.")
+
+    # --- MACD (+/- 6): histogram direction + crossover ---
+    if macd_line != 0.0 or macd_signal != 0.0:
+        if macd_line > macd_signal and macd_hist > 0:
+            score += 6
+            rationale.append(f"MACD is bullish ({macd_line:.4f} > signal {macd_signal:.4f}, hist {macd_hist:+.4f}).")
+        elif macd_line < macd_signal and macd_hist < 0:
+            score -= 6
+            rationale.append(f"MACD is bearish ({macd_line:.4f} < signal {macd_signal:.4f}, hist {macd_hist:+.4f}).")
+        elif macd_hist > 0:
+            score += 3
+            rationale.append(f"MACD histogram is positive ({macd_hist:+.4f}), suggesting building momentum.")
+        elif macd_hist < 0:
+            score -= 3
+            rationale.append(f"MACD histogram is negative ({macd_hist:+.4f}), suggesting fading momentum.")
 
     # --- VWAP position (+/- 6) ---
     if has_vwap and vwap > 0:
@@ -300,6 +344,9 @@ def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
         "sma_50": round(sma_50, 4),
         "ema_9": round(ema_9, 4),
         "ema_21": round(ema_21, 4),
+        "macd_line": macd_line,
+        "macd_signal": macd_signal,
+        "macd_hist": macd_hist,
         "rsi": round(rsi, 2),
         "range_position": round(range_position, 2),
         "vol_ratio": round(vol_ratio, 2),

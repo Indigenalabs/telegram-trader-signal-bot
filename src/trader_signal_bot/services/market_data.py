@@ -3,9 +3,30 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from urllib.parse import quote
 
+import time
+
 import requests
 
 from trader_signal_bot.domain import AssetClass, PriceSnapshot
+
+
+def _get_with_retry(url: str, headers: dict | None = None, params: dict | None = None, timeout: float = 20.0, retries: int = 3) -> requests.Response:
+    """GET with exponential backoff — handles 429 and transient 5xx."""
+    delay = 2.0
+    last_exc: Exception = RuntimeError("No attempts made")
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=headers or {}, params=params, timeout=timeout)
+            if response.status_code == 429:
+                time.sleep(delay * (2 ** attempt))
+                continue
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(delay * (2 ** attempt))
+    raise last_exc
 
 
 def classify_ticker(ticker: str) -> AssetClass:
@@ -168,10 +189,10 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
             high=float(latest["high"]),
             low=float(latest["low"]),
             volume=float(latest.get("volume") or 0.0),
-            history=closes[-60:],
-            history_high=highs[-60:],
-            history_low=lows[-60:],
-            history_volume=volumes[-60:],
+            history=closes[-self.limit:],
+            history_high=highs[-self.limit:],
+            history_low=lows[-self.limit:],
+            history_volume=volumes[-self.limit:],
             meta={
                 "exchange": payload.get("meta", {}).get("exchange", "Twelve Data"),
                 "market_cap": None,
@@ -212,12 +233,10 @@ class YahooMarketDataProvider(MarketDataProvider):
             f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(ticker)}"
             f"?range={range_str}&interval={yf_interval}&includePrePost=false&events=div%2Csplits"
         )
-        response = requests.get(
+        response = _get_with_retry(
             url,
             headers={"User-Agent": "ultimate-trader-signal-bot/0.1"},
-            timeout=20.0,
         )
-        response.raise_for_status()
 
         payload = response.json()
         result = (payload.get("chart", {}).get("result") or [None])[0]
@@ -248,10 +267,10 @@ class YahooMarketDataProvider(MarketDataProvider):
             high=day_high,
             low=day_low,
             volume=volume,
-            history=closes[-60:],
-            history_high=highs[-60:],
-            history_low=lows[-60:],
-            history_volume=volumes[-60:],
+            history=closes[-self.limit:],
+            history_high=highs[-self.limit:],
+            history_low=lows[-self.limit:],
+            history_volume=volumes[-self.limit:],
             meta={
                 "exchange": meta.get("exchangeName", "unknown"),
                 "market_cap": meta.get("marketCap"),

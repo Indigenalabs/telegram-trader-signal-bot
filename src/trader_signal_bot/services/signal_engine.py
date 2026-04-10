@@ -285,6 +285,8 @@ class SignalEngine:
         }
         trade_type = _trade_type_labels.get(candle_interval, "DAY TRADE")
 
+        scores = {name: round(score.score, 2) for name, score in analyses.items()}
+        scores["candle_interval"] = candle_interval  # type: ignore[assignment]
         signal = Signal(
             ticker=snapshot.ticker,
             asset_class=snapshot.asset_class,
@@ -298,7 +300,7 @@ class SignalEngine:
             confidence=base_confidence,
             timeframe=timeframe,
             rationale=rationale,
-            scores={name: round(score.score, 2) for name, score in analyses.items()},
+            scores=scores,
             base_confidence=base_confidence,
             confluence_count=confluence_count,
             confluence_signals=confluence_signals,

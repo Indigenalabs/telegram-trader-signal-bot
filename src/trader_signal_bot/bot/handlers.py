@@ -70,9 +70,16 @@ def _position_size_line(signal: Signal, settings: Settings) -> str:
         return ""
 
 
+def _format_scores(scores: dict[str, float]) -> str:
+    """Format scores dict as a compact, readable string — excluding non-score keys."""
+    _score_keys = ("technical", "fundamental", "sentiment", "risk", "macro")
+    parts = [f"{k[:4].title()}: {scores[k]:.0f}" for k in _score_keys if k in scores]
+    return " | ".join(parts)
+
+
 def _signal_text(signal: Signal, settings: Settings | None = None) -> str:
     learning_line = (
-        f"Learning: base {signal.base_confidence}% | adjustment {signal.learning_adjustment:+d} | "
+        f"Learning: base {signal.base_confidence}% | adj {signal.learning_adjustment:+d} | "
         f"expectancy {signal.learned_expectancy:+.2f}R | support {signal.learned_sample_size}\n"
         if signal.side != SignalSide.NEUTRAL
         else ""
@@ -82,6 +89,10 @@ def _signal_text(signal: Signal, settings: Settings | None = None) -> str:
         if signal.side != SignalSide.NEUTRAL
         else ""
     )
+    confluence_block = ""
+    if signal.side != SignalSide.NEUTRAL and signal.confluence_signals:
+        items = "\n".join(f"  ✓ {c}" for c in signal.confluence_signals)
+        confluence_block = f"Confluence factors:\n{items}\n"
     size_line = _position_size_line(signal, settings) if settings is not None else ""
     trade_type = getattr(signal, "trade_type", "DAY TRADE")
     type_icon = {"SCALP": "⚡", "DAY TRADE": "🔥", "SWING": "📊", "LONG PLAY": "🏹"}.get(trade_type, "📈")
@@ -91,7 +102,7 @@ def _signal_text(signal: Signal, settings: Settings | None = None) -> str:
         f"Session: {signal.market_session}\n"
         f"Market: {signal.price_source} {signal.pricing_symbol} ({signal.pricing_currency})\n"
         f"Price now: {signal.current_price}\n"
-        f"Entry: {signal.entry_low} to {signal.entry_high}\n"
+        f"Entry: {signal.entry_low} – {signal.entry_high}\n"
         f"Stop: {signal.stop_loss}\n"
         f"TP1: {signal.take_profit_1} | TP2: {signal.take_profit_2}\n"
         f"Confidence: {signal.confidence}%\n"
@@ -99,8 +110,9 @@ def _signal_text(signal: Signal, settings: Settings | None = None) -> str:
         f"{size_line}"
         f"{learning_line}"
         f"Timeframe: {signal.timeframe}\n"
+        f"Scores: {_format_scores(signal.scores)}\n"
+        f"{confluence_block}"
         f"Rationale:\n- " + "\n- ".join(signal.rationale[:4]) + "\n\n"
-        f"Scores: {signal.scores}\n"
         f"<i>{signal.disclaimer}</i>"
     )
 
@@ -132,11 +144,29 @@ def _is_strong_signal(signal: Signal, settings: Settings) -> bool:
 
 
 def _signal_expires_at(signal: Signal) -> str:
-    """Parse the signal timeframe string and return an ISO expiry timestamp."""
-    timeframe = signal.timeframe
-    match = re.search(r"(\d+)", timeframe.split("-")[-1] if "-" in timeframe else timeframe)
-    days = int(match.group(1)) if match else 7
-    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    """Parse the signal timeframe string and return an ISO expiry timestamp.
+
+    Examples: "2-8 hours" → 8 hours, "2-5 days" → 5 days, "1-3 weeks" → 21 days
+    """
+    timeframe = signal.timeframe.lower()
+    # Take the upper bound of a range (e.g. "2-8 hours" → "8 hours")
+    part = timeframe.split("-")[-1].strip()
+    match = re.search(r"(\d+)\s*(minute|hour|day|week)", part)
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2)
+        if unit.startswith("minute"):
+            delta = timedelta(minutes=value)
+        elif unit.startswith("hour"):
+            delta = timedelta(hours=value)
+        elif unit.startswith("week"):
+            delta = timedelta(weeks=value)
+        else:
+            delta = timedelta(days=value)
+    else:
+        # Fallback: 8 hours is a safe default for day trading
+        delta = timedelta(hours=8)
+    return (datetime.now(timezone.utc) + delta).isoformat()
 
 
 def _build_tracked_trade(
@@ -405,7 +435,7 @@ def build_handlers(
             update,
             (
                 f"<b>{settings.bot_name}</b>\n"
-                "Commands: /signals <ticker>, /scan [tickers|preset], /analyze <ticker>, /news <ticker>, /gameplan, /pending, /watchlist, "
+                "Commands: /signals <ticker>, /scan [tickers|preset], /analyze <ticker>, /news <ticker>, /gameplan, /pending, /close <ticker> [win|loss], /interval <tf>, /watchlist, "
                 "/portfolio, /risk, /settings, /mychatid, /alerts, /stats, /model, /dashboard, /metrics, /report, /leaderboard\n\n"
                 "Presets: crypto, stocks, forex, metals, energy, futures\n\n"
                 "This bot is for research and informational use only."
@@ -451,6 +481,11 @@ def build_handlers(
         ticker = context.args[0] if context.args else settings.default_tickers[0]
         try:
             signal = engine.generate_signal(ticker)
+            # Apply same filters as live alerts so manual queries match what the bot would send
+            if learning_service is not None:
+                should_block, block_reason = learning_service.should_block_signal(signal)
+                if should_block and signal.side != SignalSide.NEUTRAL:
+                    signal.rationale.insert(0, f"⛔ Weak edge filter: {block_reason}")
             guarded_reply(update, _signal_text(signal, settings=settings))
         except Exception as exc:
             guarded_reply(update, f"Could not generate a signal for {ticker}: {exc}")
@@ -459,15 +494,41 @@ def build_handlers(
         ticker = context.args[0] if context.args else settings.default_tickers[0]
         try:
             snapshot, analyses = engine.analyze(ticker)
+            tech_facts = analyses["technical"].facts
+            indicator_lines: list[str] = []
+            if "ema_9" in tech_facts and "ema_21" in tech_facts:
+                cross = "bullish" if tech_facts["ema_9"] > tech_facts["ema_21"] else "bearish"
+                indicator_lines.append(f"EMA 9/21: {tech_facts['ema_9']} / {tech_facts['ema_21']} ({cross})")
+            if "vwap" in tech_facts:
+                vwap_pos = "above" if snapshot.current_price > tech_facts["vwap"] else "below"
+                indicator_lines.append(f"VWAP: {tech_facts['vwap']} (price is {vwap_pos})")
+            if "atr" in tech_facts:
+                indicator_lines.append(f"ATR(14): {tech_facts['atr']}")
+            if "vol_ratio" in tech_facts:
+                indicator_lines.append(f"Volume ratio: {tech_facts['vol_ratio']}x avg")
+            if tech_facts.get("is_choppy"):
+                indicator_lines.append("⚠️ Regime: CHOPPY — directional edge suppressed")
+            else:
+                indicator_lines.append("Regime: TRENDING")
+            if "macd_line" in tech_facts and tech_facts.get("macd_line") != 0.0:
+                hist = tech_facts.get("macd_hist", 0.0)
+                trend = "bullish" if hist > 0 else "bearish"
+                indicator_lines.append(f"MACD: line {tech_facts['macd_line']} | signal {tech_facts['macd_signal']} | hist {hist:+} ({trend})")
+            if "rsi" in tech_facts:
+                indicator_lines.append(f"RSI(14): {tech_facts['rsi']}")
+
+            indicator_block = "\n".join(indicator_lines)
+            score_block = "\n".join(
+                f"<b>{name.title()}</b> ({round(score.score, 1)}): {score.rationale[0]}"
+                for name, score in analyses.items()
+            )
             text = (
                 f"🔎 <b>Analysis</b> - {snapshot.ticker}\n"
                 f"Price: {snapshot.current_price} {snapshot.currency}\n"
                 f"Day Change: {round(snapshot.meta.get('day_change_pct', 0.0), 2)}%\n"
-                f"Asset: {snapshot.asset_class.value}\n\n"
-                + "\n".join(
-                    f"<b>{name.title()}</b>: {round(score.score, 2)} | {score.rationale[0]}"
-                    for name, score in analyses.items()
-                )
+                f"Asset: {snapshot.asset_class.value} | Session: {snapshot.meta.get('candle_interval', '')} candles\n\n"
+                f"<b>Indicators</b>\n{indicator_block}\n\n"
+                f"<b>Scores</b>\n{score_block}"
             )
             guarded_reply(update, text)
         except Exception as exc:
@@ -764,6 +825,9 @@ def build_handlers(
         if not chat_ids:
             return
         metrics = learning_service.metrics_summary("daily")
+        # Skip the report if no trades closed today — avoid spam when bot is starting out
+        if int(metrics.get("total_trades", 0)) == 0:
+            return
         text = _performance_report_text(metrics, "Daily")
         for chat_id in sorted(chat_ids):
             context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
@@ -777,6 +841,9 @@ def build_handlers(
         if not chat_ids:
             return
         metrics = learning_service.metrics_summary("weekly")
+        # Skip the weekly report if no trades closed this week
+        if int(metrics.get("total_trades", 0)) == 0:
+            return
         text = _performance_report_text(metrics, "Weekly")
         for chat_id in sorted(chat_ids):
             context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
@@ -847,6 +914,15 @@ def build_handlers(
                     continue
 
                 tracked_trade = state.get_tracked_trade(chat_id, signal.ticker)
+
+                # Expire stale ARMING trades so they don't permanently block new signals
+                if tracked_trade is not None and tracked_trade.stage == TradeStage.ARMING and tracked_trade.expires_at:
+                    try:
+                        if datetime.now(timezone.utc) >= datetime.fromisoformat(tracked_trade.expires_at):
+                            state.clear_tracked_trade(chat_id, signal.ticker)
+                            tracked_trade = None
+                    except ValueError:
+                        pass
 
                 if tracked_trade is not None and tracked_trade.stage == TradeStage.SIGNAL:
                     # Check TP/SL hit first
@@ -991,6 +1067,84 @@ def build_handlers(
                         parse_mode=ParseMode.HTML,
                     )
 
+    _VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1w"}
+
+    def interval_cmd(update: Update, context: CallbackContext) -> None:
+        """Switch the bot's candle interval live without restarting."""
+        if not context.args:
+            guarded_reply(
+                update,
+                f"Current interval: <b>{settings.candle_interval}</b>\n"
+                f"Usage: /interval <timeframe>\n"
+                f"Valid: {', '.join(sorted(_VALID_INTERVALS))}",
+            )
+            return
+        tf = context.args[0].lower()
+        if tf not in _VALID_INTERVALS:
+            guarded_reply(update, f"Invalid interval '{tf}'. Valid: {', '.join(sorted(_VALID_INTERVALS))}")
+            return
+        # Update settings and all three provider intervals at runtime
+        settings.candle_interval = tf
+        engine.provider.binance_provider.interval = tf  # type: ignore[attr-defined]
+        engine.provider.yahoo_provider.interval = tf  # type: ignore[attr-defined]
+        if engine.provider.twelvedata_provider is not None:  # type: ignore[attr-defined]
+            engine.provider.twelvedata_provider.interval = tf  # type: ignore[attr-defined]
+        engine.provider.interval = tf  # type: ignore[attr-defined]
+        _trade_type_labels = {
+            "1m": "SCALP", "5m": "SCALP", "15m": "DAY TRADE",
+            "30m": "DAY TRADE", "1h": "DAY TRADE", "2h": "DAY TRADE",
+            "4h": "SWING", "1d": "SWING", "1w": "LONG PLAY",
+        }
+        trade_type = _trade_type_labels.get(tf, "DAY TRADE")
+        guarded_reply(update, f"Interval switched to <b>{tf}</b> ({trade_type}). Next signal scan will use the new timeframe.")
+
+    def close_cmd(update: Update, context: CallbackContext) -> None:
+        """Manually close a tracked trade and record the outcome to the learning model."""
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        if not context.args:
+            guarded_reply(update, "Usage: /close <ticker> [win|loss]\nExample: /close BTC-USD win")
+            return
+        ticker = context.args[0].upper()
+        outcome_arg = context.args[1].lower() if len(context.args) > 1 else None
+        tracked_trade = state.get_tracked_trade(chat_id, ticker)
+        if tracked_trade is None:
+            guarded_reply(update, f"No open tracked signal for {ticker}.")
+            return
+        try:
+            signal = engine.generate_signal(ticker)
+        except Exception as exc:
+            guarded_reply(update, f"Could not fetch current price for {ticker}: {exc}")
+            return
+
+        profile = state.get_profile(chat_id)
+        entry_reference, position_size = _tracked_position_entry_and_size(profile, ticker)
+        metrics = _trade_close_metrics(tracked_trade, signal, entry_reference=entry_reference, position_size=position_size)
+        r_multiple = float(metrics.get("r_multiple") or 0.0)
+
+        # Let the user override win/loss; otherwise infer from R multiple
+        if outcome_arg == "win":
+            outcome = TradeStage.CLOSED_SUCCESS
+        elif outcome_arg == "loss":
+            outcome = TradeStage.CLOSED_FAILURE
+        else:
+            outcome = TradeStage.CLOSED_SUCCESS if r_multiple > 0 else TradeStage.CLOSED_FAILURE
+
+        if learning_service is not None:
+            learning_service.record_trade_close(tracked_trade, signal, outcome, metrics)
+        state.clear_tracked_trade(chat_id, ticker)
+        verdict = "SUCCESS" if outcome == TradeStage.CLOSED_SUCCESS else "FAILURE"
+        icon = "✅" if outcome == TradeStage.CLOSED_SUCCESS else "❌"
+        guarded_reply(
+            update,
+            f"{icon} <b>MANUALLY CLOSED</b> - {verdict}\n"
+            f"Ticker: {ticker}\n"
+            f"Direction: {tracked_trade.side.value}\n"
+            f"Stage at close: {tracked_trade.stage.value}\n"
+            f"Price at close: {signal.current_price}\n"
+            f"Return: {metrics['return_pct']}% | R: {r_multiple:+.2f}R\n"
+            f"<i>Outcome recorded to learning model.</i>",
+        )
+
     def pending_cmd(update: Update, context: CallbackContext) -> None:
         chat_id = update.effective_chat.id if update.effective_chat else 0
         profile = state.get_profile(chat_id)
@@ -1016,8 +1170,14 @@ def build_handlers(
                 if trade.expires_at:
                     try:
                         exp = datetime.fromisoformat(trade.expires_at)
-                        days_left = (exp - datetime.now(timezone.utc)).days
-                        expires_label = f" | expires in {max(0, days_left)}d"
+                        remaining = exp - datetime.now(timezone.utc)
+                        total_hours = remaining.total_seconds() / 3600
+                        if total_hours <= 0:
+                            expires_label = " | expired"
+                        elif total_hours < 24:
+                            expires_label = f" | expires in {max(1, int(total_hours))}h"
+                        else:
+                            expires_label = f" | expires in {int(total_hours // 24)}d"
                     except ValueError:
                         pass
                 lines.append(
@@ -1049,6 +1209,8 @@ def build_handlers(
     dispatcher.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     dispatcher.add_handler(CommandHandler("settings", settings_cmd))
     dispatcher.add_handler(CommandHandler("pending", pending_cmd))
+    dispatcher.add_handler(CommandHandler("close", close_cmd))
+    dispatcher.add_handler(CommandHandler("interval", interval_cmd))
 
     if updater.job_queue is not None:
         updater.job_queue.run_daily(

@@ -41,6 +41,7 @@ class LearningService:
             "asset_session": {},
             "ticker": {},
             "side": {},
+            "interval": {},
         }
         self._load()
 
@@ -84,6 +85,7 @@ class LearningService:
             "confidence": trade.confidence,
             "market_session": trade.market_session,
             "signal_quality": trade.signal_quality,
+            "candle_interval": str(trade.scores.get("candle_interval", "")),
             "scores": trade.scores,
             "opened_at": trade.opened_at,
         }
@@ -116,6 +118,7 @@ class LearningService:
             "side": trade.side.value,
             "market_session": trade.market_session,
             "signal_quality": trade.signal_quality,
+            "candle_interval": str(trade.scores.get("candle_interval", "")),
             "confidence": trade.confidence,
             "scores": trade.scores,
             "opened_at": trade.opened_at,
@@ -136,12 +139,13 @@ class LearningService:
             self.sqlite_store.record_trade_close(trade, signal, outcome, metrics)
         self.refresh_model()
 
-    def _bucket_key(self, asset_class: str, market_session: str, ticker: str, side: str) -> dict[str, str]:
+    def _bucket_key(self, asset_class: str, market_session: str, ticker: str, side: str, candle_interval: str = "") -> dict[str, str]:
         return {
             "asset_class": asset_class,
             "asset_session": f"{asset_class}|{market_session}",
             "ticker": ticker,
             "side": side,
+            "interval": f"{asset_class}|{candle_interval}" if candle_interval else asset_class,
         }
 
     def refresh_model(self) -> None:
@@ -150,6 +154,7 @@ class LearningService:
             "asset_session": defaultdict(list),
             "ticker": defaultdict(list),
             "side": defaultdict(list),
+            "interval": defaultdict(list),
         }
         for item in self.history.get("closures", []):
             keys = self._bucket_key(
@@ -157,6 +162,7 @@ class LearningService:
                 market_session=str(item.get("market_session", "")),
                 ticker=str(item.get("ticker", "")),
                 side=str(item.get("side", "")),
+                candle_interval=str(item.get("candle_interval", "")),
             )
             for bucket_name, bucket_key in keys.items():
                 buckets[bucket_name][bucket_key].append(item)
@@ -166,6 +172,7 @@ class LearningService:
             "asset_session": {},
             "ticker": {},
             "side": {},
+            "interval": {},
         }
         for bucket_name, entries in buckets.items():
             for key, rows in entries.items():
@@ -194,11 +201,13 @@ class LearningService:
         return int(edge["adjustment"]), list(edge["notes"])
 
     def edge_context_for_signal(self, signal: Signal) -> dict[str, Any]:
+        candle_interval = str(signal.scores.get("candle_interval", ""))
         keys = self._bucket_key(
             asset_class=signal.asset_class.value,
             market_session=signal.market_session,
             ticker=signal.ticker,
             side=signal.side.value,
+            candle_interval=candle_interval,
         )
         weighted_adjustment = 0.0
         weighted_expectancy = 0.0
@@ -208,10 +217,11 @@ class LearningService:
         total_weight = 0.0
         notes: list[str] = []
         weights = {
-            "asset_class": 0.35,
-            "asset_session": 0.30,
+            "asset_class": 0.25,
+            "asset_session": 0.25,
             "ticker": 0.20,
             "side": 0.15,
+            "interval": 0.15,
         }
         for bucket_name, key in keys.items():
             payload = self.model.get(bucket_name, {}).get(key)
@@ -280,13 +290,15 @@ class LearningService:
     def should_block_signal(self, signal: Signal) -> tuple[bool, str]:
         if not self.block_negative_edges or signal.side == SignalSide.NEUTRAL:
             return False, ""
+        candle_interval = str(signal.scores.get("candle_interval", ""))
         keys = self._bucket_key(
             asset_class=signal.asset_class.value,
             market_session=signal.market_session,
             ticker=signal.ticker,
             side=signal.side.value,
+            candle_interval=candle_interval,
         )
-        bucket_order = ("ticker", "asset_session", "asset_class")
+        bucket_order = ("ticker", "interval", "asset_session", "asset_class")
         for bucket_name in bucket_order:
             payload = self.model.get(bucket_name, {}).get(keys[bucket_name])
             if not payload:

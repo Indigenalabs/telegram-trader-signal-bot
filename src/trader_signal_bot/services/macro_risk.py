@@ -43,4 +43,9 @@ class MacroRiskService:
             return "Federal Reserve OR inflation OR CPI OR PCE OR yields OR central bank"
         if signal.ticker.upper() in {"CL=F", "BZ=F", "NG=F", "XOM", "CVX"}:
             return "OPEC OR crude inventories OR oil supply OR energy demand"
+        if signal.asset_class == AssetClass.CRYPTO:
+            return "crypto regulation OR SEC crypto OR Bitcoin ETF OR stablecoin OR crypto ban OR CFTC crypto"
+        if signal.asset_class in {AssetClass.STOCK, AssetClass.ETF}:
+            # Use the ticker itself plus broad market risk events
+            return f"{signal.ticker} OR tariff OR earnings OR Fed rate OR recession OR market crash"
         return ""
