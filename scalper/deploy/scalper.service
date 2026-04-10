@@ -1,0 +1,17 @@
+[Unit]
+Description=Crypto Scalper Paper Trading Bot
+After=network-online.target telegram-trader-signal-bot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/scalper
+EnvironmentFile=/opt/scalper/.env
+ExecStart=/opt/scalper/.venv/bin/python main.py
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

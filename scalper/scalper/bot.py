@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from datetime import datetime, timezone
+
+from .config import Config
+from .database import Database
+from .paper_trader import PaperTrader
+from .telegram_notifier import TelegramNotifier
+
+log = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+class ScalperBot:
+    def __init__(self) -> None:
+        self.cfg = Config()
+        self.db = Database(self.cfg.DB_PATH)
+        self.notifier = TelegramNotifier(
+            token=self.cfg.TELEGRAM_BOT_TOKEN,
+            chat_id=self.cfg.TELEGRAM_CHAT_ID,
+        )
+        self.trader = PaperTrader(
+            db=self.db,
+            cfg=self.cfg,
+            on_trade_opened=self._on_opened,
+            on_trade_closed=self._on_closed,
+        )
+        self._last_report_day: int = -1
+
+    def _on_opened(self, trade: dict) -> None:
+        self.notifier.trade_opened(trade)
+
+    def _on_closed(self, trade: dict) -> None:
+        self.notifier.trade_closed(trade)
+
+    def _maybe_daily_report(self) -> None:
+        now = datetime.now(timezone.utc)
+        if now.hour == self.cfg.REPORT_HOUR_UTC and now.day != self._last_report_day:
+            self._last_report_day = now.day
+            stats = self.db.get_stats(days=1)
+            capital = self.cfg.INITIAL_CAPITAL + self.db.get_stats(days=3650).get("total_pnl", 0.0)
+            leaderboard = self.db.get_leaderboard(limit=5)
+            self.notifier.daily_report(stats, capital, leaderboard)
+            self.db.save_performance_snapshot(stats, capital, period="daily")
+            log.info("Daily report sent")
+
+    def _check_live_readiness(self) -> None:
+        stats = self.db.get_stats(days=3650)
+        total = stats["total"]
+        if total == self.cfg.MIN_PAPER_TRADES_FOR_LIVE:
+            wr = stats["win_rate"]
+            pf = stats["profit_factor"]
+            ar = stats["avg_r"]
+            self.notifier.send(
+                f"🎓 <b>Paper trading milestone: {total} trades</b>\n"
+                f"Win Rate: {wr:.1f}%  |  Profit Factor: {pf:.2f}  |  Avg R: {ar:+.2f}R\n\n"
+                "Review results before switching to live trading."
+            )
+
+    def run(self) -> None:
+        _setup_logging()
+        log.info("ScalperBot initialising")
+        self.notifier.startup_message(self.cfg.TICKERS, self.cfg.PAPER_TRADING)
+
+        while True:
+            try:
+                self.trader.run_once()
+                self._maybe_daily_report()
+                self._check_live_readiness()
+            except Exception:
+                log.exception("Unhandled error in main loop")
+            time.sleep(self.cfg.SCAN_INTERVAL_SECONDS)
