@@ -121,7 +121,11 @@ class SignalEngine:
     def _edge_score(self, signal: Signal) -> int:
         confluence_pct = min(100.0, (signal.confluence_count / 5) * 100)
         expectancy_boost = max(-8.0, min(12.0, signal.learned_expectancy * 10))
-        win_rate_boost = max(-6.0, min(10.0, (signal.learned_win_rate - 50.0) * 0.22))
+        # When model is cold (no samples), treat win rate as neutral 50 — not 0.
+        # A win_rate of 0 means "no data", not "always loses". Penalising cold signals
+        # creates a death spiral where the bot never fires to collect the data it needs.
+        effective_win_rate = signal.learned_win_rate if signal.learned_sample_size >= 3 else 50.0
+        win_rate_boost = max(-6.0, min(10.0, (effective_win_rate - 50.0) * 0.22))
         support_boost = min(8.0, signal.learned_sample_size * 0.6)
         raw = (
             signal.confidence * 0.52
