@@ -70,6 +70,30 @@ def _position_size_line(signal: Signal, settings: Settings) -> str:
         return ""
 
 
+def _sr_block(signal: Signal) -> str:
+    """Format support and resistance levels into a compact, readable block."""
+    lines: list[str] = []
+    current = signal.current_price
+
+    if signal.resistance_levels:
+        res_parts = []
+        for price, touches in signal.resistance_levels[:3]:
+            dist = abs(price - current) / current * 100
+            strength = "★★" if touches >= 3 else ("★" if touches >= 2 else "")
+            res_parts.append(f"{price} ({dist:.1f}%↑){strength}")
+        lines.append("R: " + " | ".join(res_parts))
+
+    if signal.support_levels:
+        sup_parts = []
+        for price, touches in signal.support_levels[:3]:
+            dist = abs(current - price) / current * 100
+            strength = "★★" if touches >= 3 else ("★" if touches >= 2 else "")
+            sup_parts.append(f"{price} ({dist:.1f}%↓){strength}")
+        lines.append("S: " + " | ".join(sup_parts))
+
+    return "\n".join(lines) + "\n" if lines else ""
+
+
 def _format_scores(scores: dict[str, float]) -> str:
     """Format scores dict as a compact, readable string — excluding non-score keys."""
     _score_keys = ("technical", "fundamental", "sentiment", "risk", "macro")
@@ -96,6 +120,7 @@ def _signal_text(signal: Signal, settings: Settings | None = None) -> str:
     size_line = _position_size_line(signal, settings) if settings is not None else ""
     trade_type = getattr(signal, "trade_type", "DAY TRADE")
     type_icon = {"SCALP": "⚡", "DAY TRADE": "🔥", "SWING": "📊", "LONG PLAY": "🏹"}.get(trade_type, "📈")
+    sr_block = _sr_block(signal)
     return (
         f"{type_icon} <b>{trade_type} — {signal.side.value}</b> - {signal.ticker}\n"
         f"Asset: {signal.asset_class.value} | Quality: {signal.signal_quality}\n"
@@ -105,6 +130,7 @@ def _signal_text(signal: Signal, settings: Settings | None = None) -> str:
         f"Entry: {signal.entry_low} – {signal.entry_high}\n"
         f"Stop: {signal.stop_loss}\n"
         f"TP1: {signal.take_profit_1} | TP2: {signal.take_profit_2}\n"
+        f"{sr_block}"
         f"Confidence: {signal.confidence}%\n"
         f"{edge_line}"
         f"{size_line}"
@@ -517,7 +543,31 @@ def build_handlers(
             if "rsi" in tech_facts:
                 indicator_lines.append(f"RSI(14): {tech_facts['rsi']}")
 
+            # Support / Resistance from raw price data
+            from trader_signal_bot.services.analysis import find_support_resistance
+            sr_text_lines: list[str] = []
+            if snapshot.history_high and snapshot.history_low:
+                sr = find_support_resistance(
+                    closes=snapshot.history,
+                    highs=snapshot.history_high,
+                    lows=snapshot.history_low,
+                    current_price=snapshot.current_price,
+                )
+                if sr.get("resistance"):
+                    res_parts = [
+                        f"{p} ({abs(p - snapshot.current_price) / snapshot.current_price * 100:.1f}%↑){'★' * min(touches, 2)}"
+                        for p, touches in sr["resistance"][:3]
+                    ]
+                    sr_text_lines.append("R: " + " | ".join(res_parts))
+                if sr.get("support"):
+                    sup_parts = [
+                        f"{p} ({abs(snapshot.current_price - p) / snapshot.current_price * 100:.1f}%↓){'★' * min(touches, 2)}"
+                        for p, touches in sr["support"][:3]
+                    ]
+                    sr_text_lines.append("S: " + " | ".join(sup_parts))
+
             indicator_block = "\n".join(indicator_lines)
+            sr_section = ("\n\n<b>Key Levels</b>\n" + "\n".join(sr_text_lines)) if sr_text_lines else ""
             score_block = "\n".join(
                 f"<b>{name.title()}</b> ({round(score.score, 1)}): {score.rationale[0]}"
                 for name, score in analyses.items()
@@ -527,7 +577,8 @@ def build_handlers(
                 f"Price: {snapshot.current_price} {snapshot.currency}\n"
                 f"Day Change: {round(snapshot.meta.get('day_change_pct', 0.0), 2)}%\n"
                 f"Asset: {snapshot.asset_class.value} | Session: {snapshot.meta.get('candle_interval', '')} candles\n\n"
-                f"<b>Indicators</b>\n{indicator_block}\n\n"
+                f"<b>Indicators</b>\n{indicator_block}"
+                f"{sr_section}\n\n"
                 f"<b>Scores</b>\n{score_block}"
             )
             guarded_reply(update, text)

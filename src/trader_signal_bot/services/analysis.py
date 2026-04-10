@@ -84,6 +84,80 @@ def _vwap(closes: list[float], highs: list[float], lows: list[float], volumes: l
     return sum(tp * v for tp, v in zip(typical_prices, volumes[-n:])) / total_vol
 
 
+def find_support_resistance(
+    closes: list[float],
+    highs: list[float],
+    lows: list[float],
+    current_price: float,
+    swing_lookback: int = 5,
+    max_levels: int = 3,
+    cluster_pct: float = 0.8,
+) -> dict[str, list[float]]:
+    """
+    Detect key support and resistance levels from swing highs/lows.
+
+    Algorithm:
+    1. Find swing highs (local max where high[i] > all highs within ±swing_lookback bars)
+       and swing lows (local min where low[i] < all lows within ±swing_lookback bars).
+    2. Cluster nearby levels that are within cluster_pct% of each other — multiple
+       touches at the same zone make it a stronger level.
+    3. Return the closest levels above (resistance) and below (support) current price,
+       sorted by proximity, with strength (touch count) attached.
+
+    Returns dict with keys:
+      "support"    — list of (price, touches) tuples below current price, nearest first
+      "resistance" — list of (price, touches) tuples above current price, nearest first
+    """
+    n = min(len(closes), len(highs), len(lows))
+    if n < swing_lookback * 2 + 1:
+        return {"support": [], "resistance": []}
+
+    raw_highs: list[float] = []
+    raw_lows: list[float] = []
+
+    for i in range(swing_lookback, n - swing_lookback):
+        left_h = highs[i - swing_lookback: i]
+        right_h = highs[i + 1: i + swing_lookback + 1]
+        if highs[i] >= max(left_h) and highs[i] >= max(right_h):
+            raw_highs.append(highs[i])
+
+        left_l = lows[i - swing_lookback: i]
+        right_l = lows[i + 1: i + swing_lookback + 1]
+        if lows[i] <= min(left_l) and lows[i] <= min(right_l):
+            raw_lows.append(lows[i])
+
+    def _cluster(prices_list: list[float]) -> list[tuple[float, int]]:
+        """Merge levels within cluster_pct% into a single level, count touches."""
+        if not prices_list:
+            return []
+        sorted_levels = sorted(prices_list)
+        clusters: list[list[float]] = [[sorted_levels[0]]]
+        for price in sorted_levels[1:]:
+            centroid = sum(clusters[-1]) / len(clusters[-1])
+            if abs(price - centroid) / centroid * 100 <= cluster_pct:
+                clusters[-1].append(price)
+            else:
+                clusters.append([price])
+        return [(round(sum(c) / len(c), 6), len(c)) for c in clusters]
+
+    all_levels = _cluster(raw_highs + raw_lows)
+
+    support = sorted(
+        [(p, t) for p, t in all_levels if p < current_price],
+        key=lambda x: current_price - x[0],
+    )[:max_levels]
+
+    resistance = sorted(
+        [(p, t) for p, t in all_levels if p > current_price],
+        key=lambda x: x[0] - current_price,
+    )[:max_levels]
+
+    return {
+        "support": [(round(p, 6), t) for p, t in support],
+        "resistance": [(round(p, 6), t) for p, t in resistance],
+    }
+
+
 def _simple_rsi(prices: list[float], period: int = 14) -> float:
     if len(prices) <= period:
         return 50.0

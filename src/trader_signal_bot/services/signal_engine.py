@@ -13,6 +13,7 @@ from trader_signal_bot.domain import (
 )
 from trader_signal_bot.services.analysis import (
     _atr,
+    find_support_resistance,
     fundamental_analysis,
     market_session_label,
     macro_analysis,
@@ -285,6 +286,91 @@ class SignalEngine:
         }
         trade_type = _trade_type_labels.get(candle_interval, "DAY TRADE")
 
+        # --- Support / Resistance ---
+        sr_levels: dict[str, list] = {"support": [], "resistance": []}
+        if snapshot.history_high and snapshot.history_low:
+            sr_levels = find_support_resistance(
+                closes=snapshot.history,
+                highs=snapshot.history_high,
+                lows=snapshot.history_low,
+                current_price=current,
+            )
+
+        support_levels = sr_levels.get("support", [])
+        resistance_levels = sr_levels.get("resistance", [])
+
+        # Snap stop-loss to a nearby S/R level when it makes geometric sense.
+        # For LONG: if the nearest support is between our calculated stop and entry,
+        #   place the stop just below that support (more natural level).
+        # For SHORT: if the nearest resistance is between entry and our calculated stop,
+        #   place the stop just above that resistance.
+        if side == SignalSide.LONG and support_levels:
+            nearest_sup_price = support_levels[0][0]
+            # Use the support level as stop if it sits between current stop and entry
+            if stop_loss < nearest_sup_price < entry_low:
+                snapped_stop = nearest_sup_price * 0.998  # just below the level
+                stop_loss = snapped_stop
+                rationale.append(
+                    f"Stop snapped to just below support at {round(nearest_sup_price, 4)} "
+                    f"({round(abs(current - nearest_sup_price) / current * 100, 2)}% away)."
+                )
+                # Recalculate TPs to maintain ratio with new stop distance
+                new_stop_dist = current - stop_loss
+                take_profit_1 = current + (new_stop_dist * 1.8)
+                take_profit_2 = current + (new_stop_dist * 3.0)
+
+        elif side == SignalSide.SHORT and resistance_levels:
+            nearest_res_price = resistance_levels[0][0]
+            if entry_high < nearest_res_price < stop_loss:
+                snapped_stop = nearest_res_price * 1.002  # just above the level
+                stop_loss = snapped_stop
+                rationale.append(
+                    f"Stop snapped to just above resistance at {round(nearest_res_price, 4)} "
+                    f"({round(abs(nearest_res_price - current) / current * 100, 2)}% away)."
+                )
+                new_stop_dist = stop_loss - current
+                take_profit_1 = current - (new_stop_dist * 1.8)
+                take_profit_2 = current - (new_stop_dist * 3.0)
+
+        # S/R proximity scoring — adjust confidence based on level context
+        if side == SignalSide.LONG and support_levels:
+            nearest_sup_price = support_levels[0][0]
+            dist_pct = abs(current - nearest_sup_price) / current * 100
+            touches = support_levels[0][1]
+            if dist_pct <= 1.5:
+                base_confidence = min(100, base_confidence + (4 if touches >= 2 else 2))
+                rationale.append(
+                    f"Entry is within {dist_pct:.1f}% of support at {round(nearest_sup_price, 4)} "
+                    f"({touches} touch{'es' if touches > 1 else ''}) — natural long zone."
+                )
+            if resistance_levels:
+                nearest_res_price = resistance_levels[0][0]
+                res_dist_pct = abs(nearest_res_price - current) / current * 100
+                if res_dist_pct <= 1.0:
+                    base_confidence = max(0, base_confidence - 5)
+                    rationale.append(
+                        f"⚠️ Resistance at {round(nearest_res_price, 4)} is only {res_dist_pct:.1f}% above entry — tight ceiling on upside."
+                    )
+
+        elif side == SignalSide.SHORT and resistance_levels:
+            nearest_res_price = resistance_levels[0][0]
+            dist_pct = abs(nearest_res_price - current) / current * 100
+            touches = resistance_levels[0][1]
+            if dist_pct <= 1.5:
+                base_confidence = min(100, base_confidence + (4 if touches >= 2 else 2))
+                rationale.append(
+                    f"Entry is within {dist_pct:.1f}% of resistance at {round(nearest_res_price, 4)} "
+                    f"({touches} touch{'es' if touches > 1 else ''}) — natural short zone."
+                )
+            if support_levels:
+                nearest_sup_price = support_levels[0][0]
+                sup_dist_pct = abs(current - nearest_sup_price) / current * 100
+                if sup_dist_pct <= 1.0:
+                    base_confidence = max(0, base_confidence - 5)
+                    rationale.append(
+                        f"⚠️ Support at {round(nearest_sup_price, 4)} is only {sup_dist_pct:.1f}% below entry — tight floor for shorts."
+                    )
+
         scores = {name: round(score.score, 2) for name, score in analyses.items()}
         scores["candle_interval"] = candle_interval  # type: ignore[assignment]
         signal = Signal(
@@ -310,6 +396,8 @@ class SignalEngine:
             market_session=market_session,
             signal_quality=signal_quality,
             trade_type=trade_type,
+            support_levels=support_levels,
+            resistance_levels=resistance_levels,
         )
         if self.learning_service is not None:
             signal = self.learning_service.apply_to_signal(signal)

@@ -84,6 +84,8 @@ class Signal:
     market_session: str = ""
     signal_quality: str = "standard"
     trade_type: str = "DAY TRADE"
+    support_levels: list[tuple[float, int]] = field(default_factory=list)
+    resistance_levels: list[tuple[float, int]] = field(default_factory=list)
     disclaimer: str = "Not financial advice. Trading involves risk of loss."
 
 
