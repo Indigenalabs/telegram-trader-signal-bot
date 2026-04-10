@@ -75,7 +75,7 @@ def main() -> None:
                     namespace=settings.bot_namespace,
                 )
             else:
-                state = UserStateStore(default_risk_per_trade=settings.default_risk_per_trade)
+                state = UserStateStore(default_risk_per_trade=settings.default_risk_per_trade, data_dir=settings.learning_data_dir)
     elif settings.sqlite_state_enabled:
         state = SQLiteStateStore(
             default_risk_per_trade=settings.default_risk_per_trade,
