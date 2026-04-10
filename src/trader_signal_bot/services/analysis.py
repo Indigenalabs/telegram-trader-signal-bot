@@ -16,6 +16,48 @@ def _pct_change(current: float, base: float) -> float:
     return ((current - base) / base) * 100
 
 
+def _ema(prices: list[float], period: int) -> float:
+    """Exponential moving average of the last N prices."""
+    if not prices:
+        return 0.0
+    k = 2.0 / (period + 1)
+    result = prices[0]
+    for price in prices[1:]:
+        result = price * k + result * (1 - k)
+    return result
+
+
+def _atr(closes: list[float], highs: list[float], lows: list[float], period: int = 14) -> float:
+    """Average True Range over the last `period` candles."""
+    n = min(len(closes), len(highs), len(lows))
+    if n < 2:
+        return 0.0
+    trs: list[float] = []
+    for i in range(max(1, n - period), n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    return mean(trs) if trs else 0.0
+
+
+def _vwap(closes: list[float], highs: list[float], lows: list[float], volumes: list[float]) -> float:
+    """Volume-weighted average price over available history."""
+    n = min(len(closes), len(highs), len(lows), len(volumes))
+    if n == 0:
+        return 0.0
+    total_vol = sum(volumes[-n:])
+    if not total_vol:
+        return closes[-1] if closes else 0.0
+    typical_prices = [
+        (closes[-n + i] + highs[-n + i] + lows[-n + i]) / 3.0
+        for i in range(n)
+    ]
+    return sum(tp * v for tp, v in zip(typical_prices, volumes[-n:])) / total_vol
+
+
 def _simple_rsi(prices: list[float], period: int = 14) -> float:
     if len(prices) <= period:
         return 50.0
@@ -110,6 +152,10 @@ def session_bias(snapshot: PriceSnapshot) -> tuple[float, str]:
 
 def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     prices = snapshot.history
+    highs = snapshot.history_high
+    lows = snapshot.history_low
+    volumes = snapshot.history_volume
+
     sma_10 = mean(prices[-10:]) if len(prices) >= 10 else mean(prices)
     sma_20 = mean(prices[-20:]) if len(prices) >= 20 else mean(prices)
     sma_50 = mean(prices[-50:]) if len(prices) >= 50 else mean(prices)
@@ -124,6 +170,29 @@ def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
         if recent_high != recent_low
         else 0.5
     )
+
+    # EMA 9 / 21 crossover
+    ema_9 = _ema(prices, 9)
+    ema_21 = _ema(prices, 21)
+
+    # VWAP (uses full available history)
+    vwap = 0.0
+    has_vwap = bool(highs and lows and volumes)
+    if has_vwap:
+        vwap = _vwap(prices, highs, lows, volumes)
+
+    # ATR for chop detection
+    atr = 0.0
+    has_ohlcv = bool(highs and lows)
+    if has_ohlcv:
+        atr = _atr(prices, highs, lows, period=14)
+
+    # Volume ratio vs 20-period average
+    vol_ratio = 1.0
+    if volumes and len(volumes) >= 2:
+        avg_vol = mean(volumes[-20:]) if len(volumes) >= 20 else mean(volumes[:-1])
+        vol_ratio = volumes[-1] / avg_vol if avg_vol else 1.0
+
     # Momentum thresholds scale with candle interval — hourly moves are ~12x smaller than daily
     candle_interval = str(snapshot.meta.get("candle_interval", "1d"))
     _intraday_scale = {
@@ -144,31 +213,59 @@ def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     score = 50.0
     rationale: list[str] = []
 
+    # --- SMA trend stack ---
     if prices[-1] > sma_10 > sma_20 > sma_50:
-        score += 24
+        score += 20
         rationale.append("Trend stack is cleanly bullish across short, medium, and swing horizons.")
     elif prices[-1] < sma_10 < sma_20 < sma_50:
-        score -= 24
+        score -= 20
         rationale.append("Trend stack is cleanly bearish across short, medium, and swing horizons.")
     elif prices[-1] > sma_20 and sma_10 > sma_20:
-        score += 10
+        score += 8
         rationale.append("Price is holding above the dominant short-term trend structure.")
     elif prices[-1] < sma_20 and sma_10 < sma_20:
-        score -= 10
+        score -= 8
         rationale.append("Price is trading below the dominant short-term trend structure.")
 
+    # --- EMA 9 / 21 crossover (+/- 8) ---
+    if ema_9 > ema_21:
+        score += 8
+        rationale.append(f"EMA 9 is above EMA 21 ({ema_9:.4f} vs {ema_21:.4f}), confirming bullish short-term momentum.")
+    else:
+        score -= 8
+        rationale.append(f"EMA 9 is below EMA 21 ({ema_9:.4f} vs {ema_21:.4f}), confirming bearish short-term momentum.")
+
+    # --- VWAP position (+/- 6) ---
+    if has_vwap and vwap > 0:
+        if prices[-1] > vwap:
+            score += 6
+            rationale.append(f"Price is trading above VWAP ({vwap:.4f}), keeping buyers in control.")
+        else:
+            score -= 6
+            rationale.append(f"Price is trading below VWAP ({vwap:.4f}), keeping sellers in control.")
+
+    # --- Volume confirmation (+/- 5) ---
+    if vol_ratio >= 1.5:
+        score += 5
+        rationale.append(f"Volume is {vol_ratio:.1f}x the recent average, confirming participation behind the move.")
+    elif vol_ratio < 0.6:
+        score -= 5
+        rationale.append(f"Volume is only {vol_ratio:.1f}x the recent average, signalling weak conviction.")
+
+    # --- Momentum ---
     if momentum_5 > threshold:
-        score += 10
+        score += 8
         rationale.append(f"Five-session momentum is strong at {momentum_5:.2f}%.")
     elif momentum_5 < -threshold:
-        score -= 10
+        score -= 8
         rationale.append(f"Five-session momentum is weak at {momentum_5:.2f}%.")
 
+    # --- RSI ---
     if 55 <= rsi <= 68:
-        score += 8
+        score += 6
         rationale.append(f"RSI confirms constructive upside pressure at {rsi:.1f}.")
     elif 32 <= rsi <= 45:
-        score -= 8
+        score -= 6
         rationale.append(f"RSI confirms downside pressure at {rsi:.1f}.")
     elif rsi > 72:
         score -= 3
@@ -176,24 +273,48 @@ def technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     else:
         rationale.append(f"RSI is balanced at {rsi:.1f}.")
 
+    # --- Range position ---
     if range_position > 0.8:
-        score += 6
+        score += 5
         rationale.append("Price is trading near the top of its recent range, which supports breakout continuation.")
     elif range_position < 0.2:
-        score -= 6
+        score -= 5
         rationale.append("Price is trapped near the bottom of its recent range, which keeps downside pressure alive.")
+
+    # --- Chop / regime filter ---
+    # If 20-period price range is less than 3x ATR the market is in a tight chop — pull score toward 50
+    is_choppy = False
+    if has_ohlcv and atr > 0:
+        price_range_20 = recent_high - recent_low
+        if price_range_20 < atr * 3.0:
+            is_choppy = True
+            # Dampen any directional bias — blend 60% back toward neutral
+            score = score * 0.40 + 50.0 * 0.60
+            rationale.append(
+                f"Market is in a tight range (range {price_range_20:.4f} < 3x ATR {atr:.4f}), so directional edge is reduced."
+            )
+
+    facts: dict = {
+        "sma_10": round(sma_10, 4),
+        "sma_20": round(sma_20, 4),
+        "sma_50": round(sma_50, 4),
+        "ema_9": round(ema_9, 4),
+        "ema_21": round(ema_21, 4),
+        "rsi": round(rsi, 2),
+        "range_position": round(range_position, 2),
+        "vol_ratio": round(vol_ratio, 2),
+        "is_choppy": is_choppy,
+    }
+    if has_ohlcv:
+        facts["atr"] = round(atr, 4)
+    if has_vwap:
+        facts["vwap"] = round(vwap, 4)
 
     return AnalysisScore(
         name="technical",
         score=max(0.0, min(score, 100.0)),
         rationale=rationale,
-        facts={
-            "sma_10": round(sma_10, 4),
-            "sma_20": round(sma_20, 4),
-            "sma_50": round(sma_50, 4),
-            "rsi": round(rsi, 2),
-            "range_position": round(range_position, 2),
-        },
+        facts=facts,
     )
 
 

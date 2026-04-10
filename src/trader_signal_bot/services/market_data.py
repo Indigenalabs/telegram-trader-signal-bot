@@ -95,6 +95,9 @@ class BinanceMarketDataProvider(MarketDataProvider):
             low=low,
             volume=volume,
             history=closes,
+            history_high=highs,
+            history_low=lows,
+            history_volume=volumes,
             meta={
                 "exchange": "Binance",
                 "market_cap": None,
@@ -149,6 +152,9 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
 
         ordered = list(reversed(values))
         closes = [float(item["close"]) for item in ordered]
+        highs = [float(item["high"]) for item in ordered]
+        lows = [float(item["low"]) for item in ordered]
+        volumes = [float(item.get("volume") or 0.0) for item in ordered]
         latest = ordered[-1]
         previous_close = closes[-2]
         current_price = float(latest["close"])
@@ -163,6 +169,9 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
             low=float(latest["low"]),
             volume=float(latest.get("volume") or 0.0),
             history=closes[-60:],
+            history_high=highs[-60:],
+            history_low=lows[-60:],
+            history_volume=volumes[-60:],
             meta={
                 "exchange": payload.get("meta", {}).get("exchange", "Twelve Data"),
                 "market_cap": None,
@@ -171,6 +180,7 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
                     if previous_close
                     else 0.0
                 ),
+                "candle_interval": self.interval,
                 "requested_ticker": ticker.upper(),
                 "pricing_symbol": ticker.upper(),
                 "price_source": "Twelve Data",
@@ -239,6 +249,9 @@ class YahooMarketDataProvider(MarketDataProvider):
             low=day_low,
             volume=volume,
             history=closes[-60:],
+            history_high=highs[-60:],
+            history_low=lows[-60:],
+            history_volume=volumes[-60:],
             meta={
                 "exchange": meta.get("exchangeName", "unknown"),
                 "market_cap": meta.get("marketCap"),
@@ -247,6 +260,7 @@ class YahooMarketDataProvider(MarketDataProvider):
                     if previous_close
                     else 0.0
                 ),
+                "candle_interval": self.interval,
                 "requested_ticker": ticker.upper(),
                 "pricing_symbol": ticker.upper(),
                 "price_source": "Yahoo Finance",

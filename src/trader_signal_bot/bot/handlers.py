@@ -18,6 +18,7 @@ from trader_signal_bot.domain import (
 )
 from trader_signal_bot.services.learning import LearningService
 from trader_signal_bot.services.macro_risk import MacroRiskService
+from trader_signal_bot.services.regime import write_market_regime
 from trader_signal_bot.services.signal_engine import SignalEngine
 from trader_signal_bot.services.state import UserStateStore
 
@@ -785,6 +786,25 @@ def build_handlers(
         if learning_service is not None:
             learning_service.refresh_model()
 
+    def regime_writer(context: CallbackContext) -> None:
+        """Hourly job: analyse each ticker and write its market regime to disk."""
+        del context
+        tickers = settings.default_tickers
+        for ticker in tickers:
+            try:
+                snapshot, analyses = engine.analyze(ticker)
+                tech = analyses["technical"]
+                facts = dict(tech.facts)
+                facts["current_price"] = snapshot.current_price
+                write_market_regime(
+                    ticker=ticker,
+                    technical_score=tech.score,
+                    facts=facts,
+                    data_dir=settings.learning_data_dir,
+                )
+            except Exception:
+                continue
+
     def live_alert_scan(context: CallbackContext) -> None:
         if not settings.live_alerts_enabled:
             return
@@ -1057,4 +1077,10 @@ def build_handlers(
             scheduled_weekly_report,
             time(hour=settings.gameplan_hour_utc, minute=(settings.gameplan_minute_utc + 4) % 60),
             name="weekly_report",
+        )
+        updater.job_queue.run_repeating(
+            regime_writer,
+            interval=60 * 60,
+            first=60,
+            name="regime_writer",
         )

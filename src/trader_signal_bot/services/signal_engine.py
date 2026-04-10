@@ -12,6 +12,7 @@ from trader_signal_bot.domain import (
     UniverseScenario,
 )
 from trader_signal_bot.services.analysis import (
+    _atr,
     fundamental_analysis,
     market_session_label,
     macro_analysis,
@@ -154,8 +155,10 @@ class SignalEngine:
             if score.rationale:
                 rationale.append(score.rationale[0])
 
+        news_risk = False
         if headlines:
             rationale.append(f"News flow is active with {len(headlines)} recent headlines in the feed.")
+            news_risk = True
 
         technical_score = analyses["technical"].score
         risk_score = analyses["risk"].score
@@ -177,7 +180,15 @@ class SignalEngine:
             "4h": "8-24 hours", "1d": "2-5 days", "1w": "1-3 weeks",
         }
 
-        stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.015 * stop_scale)
+        # ATR-based stop distance — more adaptive than fixed % of price
+        atr_value = 0.0
+        if snapshot.history_high and snapshot.history_low:
+            atr_value = _atr(snapshot.history, snapshot.history_high, snapshot.history_low, period=14)
+        if atr_value > 0:
+            stop_distance = atr_value * 1.5 * stop_scale
+        else:
+            stop_distance = max(abs(snapshot.high - snapshot.low), current * 0.015 * stop_scale)
+
         market_session = market_session_label(snapshot)
 
         if snapshot.asset_class.value in {"stock", "etf"}:
@@ -247,6 +258,12 @@ class SignalEngine:
             confidence = round(((100.0 - weighted_score) * 0.7) + (risk_score * 0.3))
         else:
             confidence = round((weighted_score * 0.7) + (risk_score * 0.3))
+
+        # News risk flag — active headlines increase uncertainty, penalise confidence slightly
+        if news_risk:
+            confidence = max(0, confidence - 3)
+            rationale.insert(0, "⚠️ NEWS RISK: Active headlines detected — treat levels as approximate until news resolves.")
+
         base_confidence = max(0, min(confidence, 100))
         confluence_count = 0
         confluence_signals: list[str] = []
