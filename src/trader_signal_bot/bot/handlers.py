@@ -1085,16 +1085,26 @@ def build_handlers(
                 ):
                     continue
 
-                if strong_signal:
+                if profile.alert_mode == "high" and signal.signal_quality == "watchlist":
+                    continue
+
+                # Auto-promote every sent signal to SIGNAL stage immediately so the bot
+                # monitors TP/SL and records outcomes without waiting for a second scan.
+                # ARMING stage is kept only for upgrading an existing ARMING trade to SIGNAL.
+                if strong_signal or tracked_trade is None or tracked_trade.stage == TradeStage.ARMING:
                     trade_id = tracked_trade.trade_id if tracked_trade is not None else None
                     tracked_trade = _build_tracked_trade(chat_id, signal, TradeStage.SIGNAL, trade_id=trade_id)
                     state.set_tracked_trade(tracked_trade)
                     if learning_service is not None:
                         learning_service.record_signal_event(tracked_trade, TradeStage.SIGNAL)
                     if state.should_send_alert(chat_id, signal.ticker, TradeStage.SIGNAL.value, signal.confidence):
+                        if strong_signal:
+                            msg_text = _signal_live_text(signal, settings=settings)
+                        else:
+                            msg_text = _arming_text(signal, settings=settings)
                         context.bot.send_message(
                             chat_id=chat_id,
-                            text=_signal_live_text(signal, settings=settings),
+                            text=msg_text,
                             parse_mode=ParseMode.HTML,
                         )
                         if hasattr(state, "log_alert"):
@@ -1102,21 +1112,6 @@ def build_handlers(
                                 state.log_alert(chat_id, signal)  # type: ignore[attr-defined]
                             except Exception:
                                 pass
-                    continue
-
-                if profile.alert_mode == "high" and signal.signal_quality == "watchlist":
-                    continue
-
-                tracked_trade = _build_tracked_trade(chat_id, signal, TradeStage.ARMING)
-                state.set_tracked_trade(tracked_trade)
-                if learning_service is not None:
-                    learning_service.record_signal_event(tracked_trade, TradeStage.ARMING)
-                if state.should_send_alert(chat_id, signal.ticker, TradeStage.ARMING.value, signal.confidence):
-                    context.bot.send_message(
-                        chat_id=chat_id,
-                        text=_arming_text(signal, settings=settings),
-                        parse_mode=ParseMode.HTML,
-                    )
 
     _VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1w"}
 
