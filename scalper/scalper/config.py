@@ -55,8 +55,8 @@ class Config:
     RISK_PER_TRADE: float = float(os.getenv("SCALPER_RISK_PER_TRADE", "0.01"))  # 1%
 
     # Exit rules (scalp — tight and fast)
-    TAKE_PROFIT_ATR_MULT: float = float(os.getenv("SCALPER_TP_ATR", "1.5"))
-    STOP_LOSS_ATR_MULT: float = float(os.getenv("SCALPER_SL_ATR", "1.0"))
+    TAKE_PROFIT_ATR_MULT: float = float(os.getenv("SCALPER_TP_ATR", "2.0"))
+    STOP_LOSS_ATR_MULT: float = float(os.getenv("SCALPER_SL_ATR", "0.8"))
     MAX_HOLD_MINUTES: int = int(os.getenv("SCALPER_MAX_HOLD_MINUTES", "30"))
 
     # Signal filters

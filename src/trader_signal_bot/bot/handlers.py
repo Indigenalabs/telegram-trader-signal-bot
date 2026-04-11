@@ -1258,6 +1258,84 @@ def build_handlers(
     dispatcher.add_handler(CommandHandler("close", close_cmd))
     dispatcher.add_handler(CommandHandler("interval", interval_cmd))
 
+    def trade_monitor(context: CallbackContext) -> None:
+        """
+        Runs every 60s independently of the signal scan.
+        Checks every open tracked trade for TP/SL hit or expiry,
+        records the outcome, and sends a close notification.
+        This is the primary learning feedback loop — it runs regardless
+        of whether a new signal fires for the ticker.
+        """
+        now = datetime.now(timezone.utc)
+        for chat_id in state.list_chat_ids():
+            profile = state.get_profile(chat_id)
+            # Collect tickers that have open tracked trades
+            open_trades: list[TrackedTrade] = []
+            for ticker in list(settings.default_tickers):
+                trade = state.get_tracked_trade(chat_id, ticker)
+                if trade is not None and trade.stage == TradeStage.SIGNAL:
+                    open_trades.append(trade)
+
+            if not open_trades:
+                continue
+
+            for trade in open_trades:
+                # Fetch current price
+                try:
+                    signal = engine.generate_signal(trade.ticker)
+                except Exception:
+                    continue
+                if signal is None:
+                    continue
+
+                price = signal.current_price
+
+                # Check TP/SL
+                outcome, reason = _trade_close_outcome(trade, signal)
+
+                # Check expiry if no TP/SL hit yet
+                if outcome is None and trade.expires_at:
+                    try:
+                        if now >= datetime.fromisoformat(trade.expires_at):
+                            close_metrics = _trade_close_metrics(
+                                trade, signal,
+                                entry_reference=None, position_size=None,
+                            )
+                            r_multiple = float(close_metrics.get("r_multiple") or 0.0)
+                            outcome = TradeStage.CLOSED_SUCCESS if r_multiple > 0 else TradeStage.CLOSED_FAILURE
+                            reason = f"Signal timeframe elapsed at {price}."
+                    except ValueError:
+                        pass
+
+                if outcome is not None:
+                    close_metrics = _trade_close_metrics(
+                        trade, signal,
+                        entry_reference=_tracked_position_entry_and_size(profile, trade.ticker)[0],
+                        position_size=_tracked_position_entry_and_size(profile, trade.ticker)[1],
+                    )
+                    try:
+                        if "elapsed" in reason:
+                            context.bot.send_message(
+                                chat_id=chat_id,
+                                text=_expired_signal_text(trade, signal, outcome, close_metrics),
+                                parse_mode=ParseMode.HTML,
+                            )
+                        else:
+                            context.bot.send_message(
+                                chat_id=chat_id,
+                                text=_closed_trade_text(
+                                    trade, signal, outcome, reason,
+                                    entry_reference=_tracked_position_entry_and_size(profile, trade.ticker)[0],
+                                    position_size=_tracked_position_entry_and_size(profile, trade.ticker)[1],
+                                ),
+                                parse_mode=ParseMode.HTML,
+                            )
+                    except Exception:
+                        pass
+                    if learning_service is not None:
+                        learning_service.record_trade_close(trade, signal, outcome, close_metrics)
+                    state.clear_tracked_trade(chat_id, trade.ticker)
+
     if updater.job_queue is not None:
         updater.job_queue.run_daily(
             scheduled_gameplan,
@@ -1291,4 +1369,10 @@ def build_handlers(
             interval=60 * 60,
             first=60,
             name="regime_writer",
+        )
+        updater.job_queue.run_repeating(
+            trade_monitor,
+            interval=60,
+            first=30,
+            name="trade_monitor",
         )

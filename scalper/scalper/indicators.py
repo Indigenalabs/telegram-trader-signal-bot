@@ -61,6 +61,29 @@ def vol_ratio(volumes: list[float], period: int = 20) -> float:
     return volumes[-1] / avg if avg else 1.0
 
 
+def macd(prices: list[float], fast: int = 12, slow: int = 26, signal_period: int = 9) -> tuple[float, float, float]:
+    """Returns (macd_line, signal_line, histogram)."""
+    if len(prices) < slow:
+        return 0.0, 0.0, 0.0
+    fast_ema = ema(prices, fast)
+    slow_ema = ema(prices, slow)
+    macd_line = fast_ema - slow_ema
+    # Signal line: EMA of last signal_period MACD values
+    macd_series = []
+    step = max(1, len(prices) // signal_period)
+    for i in range(signal_period):
+        idx = len(prices) - (signal_period - i) * step
+        if idx < slow:
+            continue
+        f = ema(prices[:idx], fast)
+        s = ema(prices[:idx], slow)
+        macd_series.append(f - s)
+    macd_series.append(macd_line)
+    signal_line = ema(macd_series, signal_period) if len(macd_series) >= signal_period else macd_line
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
 def is_choppy(closes: list[float], highs: list[float], lows: list[float], atr_val: float, window: int = 20) -> bool:
     if atr_val <= 0 or len(closes) < window:
         return False
@@ -80,8 +103,7 @@ def score_signal(
     Score a potential scalp signal. Returns dict with:
     - side: 'LONG', 'SHORT', or None
     - score: 0-100
-    - atr_val: float
-    - vwap_val: float
+    - atr_val, vwap_val, ema9, ema21, rsi, vol_ratio, macd_hist
     - details: list of reason strings
     """
     e9 = ema(closes, 9)
@@ -91,6 +113,7 @@ def score_signal(
     vwap_val = vwap(closes, highs, lows, volumes)
     vr = vol_ratio(volumes)
     choppy = is_choppy(closes, highs, lows, atr_val)
+    macd_line, macd_signal, macd_hist = macd(closes)
 
     score = 50.0
     details: list[str] = []
@@ -99,45 +122,87 @@ def score_signal(
         return {"side": None, "score": 50.0, "atr_val": atr_val, "vwap_val": vwap_val,
                 "details": ["Market is in chop — no scalp edge."]}
 
-    # EMA crossover
-    if e9 > e21:
+    # --- EMA trend direction (+/-12) ---
+    ema_bull = e9 > e21
+    if ema_bull:
         score += 12
         details.append(f"EMA9 > EMA21 ({e9:.4f} > {e21:.4f})")
     else:
         score -= 12
         details.append(f"EMA9 < EMA21 ({e9:.4f} < {e21:.4f})")
 
-    # VWAP
+    # --- MACD momentum confirmation (+/-8) ---
+    if macd_hist > 0:
+        score += 8
+        details.append(f"MACD bullish (hist={macd_hist:.4f})")
+    elif macd_hist < 0:
+        score -= 8
+        details.append(f"MACD bearish (hist={macd_hist:.4f})")
+
+    # --- VWAP price location (+/-8) ---
     if vwap_val > 0:
         if current_price > vwap_val:
-            score += 10
+            score += 8
             details.append(f"Price above VWAP ({vwap_val:.4f})")
         else:
-            score -= 10
+            score -= 8
             details.append(f"Price below VWAP ({vwap_val:.4f})")
 
-    # RSI
-    if 45 <= rsi_val <= 68:
-        score += 8
-        details.append(f"RSI bullish zone ({rsi_val:.1f})")
-    elif 32 <= rsi_val <= 55:
-        score -= 8
-        details.append(f"RSI bearish zone ({rsi_val:.1f})")
+    # --- RSI: reward confirmation, punish contradiction (+/-10) ---
+    # For LONG signals (score trending up): RSI 45-70 is ideal, <35 or >75 is bad
+    # For SHORT signals (score trending down): RSI 30-55 is ideal
+    # Evaluate after EMA/MACD so we know which direction score is leaning
+    tentative_long = score >= 50
+    if tentative_long:
+        if 45 <= rsi_val <= 70:
+            score += 10
+            details.append(f"RSI confirms LONG ({rsi_val:.1f})")
+        elif rsi_val > 75:
+            score -= 8
+            details.append(f"RSI overbought ({rsi_val:.1f}) — late entry risk")
+        elif rsi_val < 35:
+            score -= 12
+            details.append(f"RSI bearish ({rsi_val:.1f}) — contradicts LONG")
+        else:
+            details.append(f"RSI neutral ({rsi_val:.1f})")
     else:
-        details.append(f"RSI neutral ({rsi_val:.1f})")
+        if 30 <= rsi_val <= 55:
+            score += 10
+            details.append(f"RSI confirms SHORT ({rsi_val:.1f})")
+        elif rsi_val < 25:
+            score -= 8
+            details.append(f"RSI oversold ({rsi_val:.1f}) — late entry risk")
+        elif rsi_val > 65:
+            score -= 12
+            details.append(f"RSI bullish ({rsi_val:.1f}) — contradicts SHORT")
+        else:
+            details.append(f"RSI neutral ({rsi_val:.1f})")
 
-    # Volume
-    if vr >= 1.2:
-        score += 8
+    # --- Volume (+/-6) ---
+    if vr >= 1.3:
+        score += 6
         details.append(f"Volume {vr:.1f}x avg — participation confirmed")
+    elif vr >= 1.1:
+        score += 3
+        details.append(f"Volume {vr:.1f}x avg — moderate participation")
     elif vr < 0.7:
-        score -= 5
+        score -= 6
         details.append(f"Volume {vr:.1f}x avg — weak participation")
 
-    # Determine side
-    if score >= 68:
+    # --- Hard filters: block contradicting signals entirely ---
+    # Don't go LONG when price is below VWAP AND MACD is bearish
+    if score >= 68 and current_price < vwap_val and macd_hist < 0:
+        return {"side": None, "score": round(score, 2), "atr_val": round(atr_val, 6),
+                "vwap_val": round(vwap_val, 6), "details": ["LONG blocked: price below VWAP with bearish MACD"]}
+    # Don't go SHORT when price is above VWAP AND MACD is bullish
+    if score <= 32 and current_price > vwap_val and macd_hist > 0:
+        return {"side": None, "score": round(score, 2), "atr_val": round(atr_val, 6),
+                "vwap_val": round(vwap_val, 6), "details": ["SHORT blocked: price above VWAP with bullish MACD"]}
+
+    # --- Determine side ---
+    if score >= 70:
         side = "LONG"
-    elif score <= 32:
+    elif score <= 30:
         side = "SHORT"
     else:
         side = None
@@ -151,5 +216,6 @@ def score_signal(
         "ema21": round(e21, 6),
         "rsi": round(rsi_val, 2),
         "vol_ratio": round(vr, 2),
+        "macd_hist": round(macd_hist, 6),
         "details": details,
     }
