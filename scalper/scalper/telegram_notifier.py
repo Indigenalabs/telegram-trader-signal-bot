@@ -61,8 +61,7 @@ class TelegramNotifier:
 
     def daily_report(self, stats: dict, capital: float, leaderboard: list[dict]) -> None:
         if stats["total"] == 0:
-            self.send("📊 <b>Scalper Daily Report</b>\nNo closed trades today.")
-            return
+            return  # Nothing to report — don't spam
 
         wr = stats["win_rate"]
         pf = stats["profit_factor"]

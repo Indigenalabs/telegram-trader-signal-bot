@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from datetime import datetime, timezone
 
@@ -35,7 +34,10 @@ class ScalperBot:
             on_trade_opened=self._on_opened,
             on_trade_closed=self._on_closed,
         )
-        self._last_report_day: int = -1
+        # Track last report date as ISO date string so it survives the hour window
+        self._last_report_date: str = ""
+        # Track milestone alerts already sent (set of trade counts)
+        self._milestones_sent: set[int] = set()
 
     def _on_opened(self, trade: dict) -> None:
         self.notifier.trade_opened(trade)
@@ -45,19 +47,28 @@ class ScalperBot:
 
     def _maybe_daily_report(self) -> None:
         now = datetime.now(timezone.utc)
-        if now.hour == self.cfg.REPORT_HOUR_UTC and now.day != self._last_report_day:
-            self._last_report_day = now.day
-            stats = self.db.get_stats(days=1)
-            capital = self.cfg.INITIAL_CAPITAL + self.db.get_stats(days=3650).get("total_pnl", 0.0)
-            leaderboard = self.db.get_leaderboard(limit=5)
-            self.notifier.daily_report(stats, capital, leaderboard)
-            self.db.save_performance_snapshot(stats, capital, period="daily")
-            log.info("Daily report sent")
+        # Only fire at the configured hour, and only once per calendar date
+        if now.hour != self.cfg.REPORT_HOUR_UTC:
+            return
+        today = now.strftime("%Y-%m-%d")
+        if today == self._last_report_date:
+            return
+        self._last_report_date = today
+        # Report on yesterday's trades (the just-completed trading day)
+        stats = self.db.get_stats(days=1)
+        capital = self.cfg.INITIAL_CAPITAL + self.db.get_stats(days=3650).get("total_pnl", 0.0)
+        leaderboard = self.db.get_leaderboard(limit=5)
+        self.notifier.daily_report(stats, capital, leaderboard)
+        self.db.save_performance_snapshot(stats, capital, period="daily")
+        log.info("Daily report sent for %s", today)
 
     def _check_live_readiness(self) -> None:
         stats = self.db.get_stats(days=3650)
         total = stats["total"]
-        if total == self.cfg.MIN_PAPER_TRADES_FOR_LIVE:
+        milestone = self.cfg.MIN_PAPER_TRADES_FOR_LIVE
+        # Only fire once when we cross the milestone, never again
+        if total >= milestone and milestone not in self._milestones_sent:
+            self._milestones_sent.add(milestone)
             wr = stats["win_rate"]
             pf = stats["profit_factor"]
             ar = stats["avg_r"]
@@ -71,6 +82,11 @@ class ScalperBot:
         _setup_logging()
         log.info("ScalperBot initialising")
         self.notifier.startup_message(self.cfg.TICKERS, self.cfg.PAPER_TRADING)
+
+        # Pre-populate milestone set so a restart doesn't re-fire old milestones
+        stats = self.db.get_stats(days=3650)
+        if stats["total"] >= self.cfg.MIN_PAPER_TRADES_FOR_LIVE:
+            self._milestones_sent.add(self.cfg.MIN_PAPER_TRADES_FOR_LIVE)
 
         while True:
             try:
