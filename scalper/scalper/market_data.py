@@ -61,6 +61,7 @@ def fetch_ohlcv(ticker: str, interval: str = "5m", limit: int = 100, api_key: st
             if len(klines) < 10:
                 return None
 
+            opens = [float(k[1]) for k in klines]
             closes = [float(k[4]) for k in klines]
             highs = [float(k[2]) for k in klines]
             lows = [float(k[3]) for k in klines]
@@ -81,6 +82,7 @@ def fetch_ohlcv(ticker: str, interval: str = "5m", limit: int = 100, api_key: st
             return {
                 "symbol": symbol,
                 "ticker": ticker.upper(),
+                "opens": opens,
                 "closes": closes,
                 "highs": highs,
                 "lows": lows,

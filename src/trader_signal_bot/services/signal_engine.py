@@ -20,6 +20,7 @@ from trader_signal_bot.services.analysis import (
     portfolio_risk_summary,
     risk_analysis,
     sentiment_analysis,
+    smc_technical_analysis,
     technical_analysis,
 )
 from trader_signal_bot.services.learning import LearningService
@@ -39,12 +40,14 @@ class SignalEngine:
         self.settings = settings
         self.news_service = news_service or NewsService()
         self.learning_service = learning_service
+        # SMC (Ajna) gets the largest weight; traditional analysis provides context
         self.weights = {
-            "technical": 0.30,
-            "fundamental": 0.25,
-            "sentiment": 0.20,
-            "risk": 0.15,
-            "macro": 0.10,
+            "smc": 0.40,
+            "technical": 0.20,
+            "fundamental": 0.15,
+            "sentiment": 0.10,
+            "risk": 0.10,
+            "macro": 0.05,
         }
 
     def _confluence_for_side(
@@ -55,6 +58,7 @@ class SignalEngine:
         min_risk: int,
     ) -> tuple[int, list[str]]:
         thresholds_long = {
+            "smc": 58,
             "technical": min_technical,
             "fundamental": 52,
             "sentiment": 52,
@@ -62,6 +66,7 @@ class SignalEngine:
             "macro": 50,
         }
         thresholds_short = {
+            "smc": 42,
             "technical": 100 - min_technical,
             "fundamental": 48,
             "sentiment": 48,
@@ -70,6 +75,10 @@ class SignalEngine:
         }
         if side == SignalSide.LONG:
             checks = {
+                "smc": (
+                    analyses["smc"].score >= thresholds_long["smc"],
+                    "SMC structure is bullish with a valid confirmation block or zone.",
+                ),
                 "technical": (
                     analyses["technical"].score >= thresholds_long["technical"],
                     "Trend stack is aligned with the long side.",
@@ -93,6 +102,10 @@ class SignalEngine:
             }
         else:
             checks = {
+                "smc": (
+                    analyses["smc"].score <= thresholds_short["smc"],
+                    "SMC structure is bearish with a valid confirmation block or zone.",
+                ),
                 "technical": (
                     analyses["technical"].score <= thresholds_short["technical"],
                     "Trend structure is weak enough to justify a short bias.",
@@ -141,6 +154,7 @@ class SignalEngine:
         # Inject candle_interval from settings so analysis functions can scale thresholds
         snapshot.meta.setdefault("candle_interval", self.settings.candle_interval)
         analyses = {
+            "smc": smc_technical_analysis(snapshot),
             "technical": technical_analysis(snapshot),
             "fundamental": fundamental_analysis(snapshot),
             "sentiment": sentiment_analysis(snapshot),
@@ -165,11 +179,18 @@ class SignalEngine:
             rationale.append(f"News flow is active with {len(headlines)} recent headlines in the feed.")
             news_risk = True
 
+        smc_score = analyses["smc"].score
         technical_score = analyses["technical"].score
         risk_score = analyses["risk"].score
         macro_score = analyses["macro"].score
         current = snapshot.current_price
         candle_interval = self.settings.candle_interval
+
+        # Pull the latest SMC confirmation block if present
+        smc_facts = analyses["smc"].facts
+        smc_conf_block = smc_facts.get("confirmation_block")
+        smc_trend = smc_facts.get("smc_trend", "ranging")
+        smc_confluences = smc_facts.get("confluences", [])
 
         # Stop distance scales with candle resolution — intraday needs tighter stops
         _stop_scale = {
@@ -226,6 +247,15 @@ class SignalEngine:
             min_technical = 58
             min_risk = 55
 
+        # Use SMC Confirmation Block for structure-based SL/TP when available
+        smc_sl: float | None = None
+        smc_tp: float | None = None
+        smc_entry: float | None = None
+        if smc_conf_block:
+            smc_sl = smc_conf_block.get("sl")
+            smc_tp = smc_conf_block.get("tp")
+            smc_entry = smc_conf_block.get("entry")
+
         if (
             weighted_score >= long_threshold
             and technical_score >= min_technical
@@ -235,9 +265,17 @@ class SignalEngine:
             side = SignalSide.LONG
             entry_low = current * 0.997
             entry_high = current * 1.003
-            stop_loss = current - stop_distance
-            take_profit_1 = current + (stop_distance * 1.8)
-            take_profit_2 = current + (stop_distance * 3.0)
+            if smc_sl and smc_conf_block.get("type") == "long" and smc_sl < current:
+                # Use Ajna structure-based stop: reversal candle low * 0.999
+                stop_loss = smc_sl
+                stop_distance = current - stop_loss
+                take_profit_1 = current + stop_distance * 2.0   # 2R (Ajna default)
+                take_profit_2 = current + stop_distance * 3.5
+                rationale.append(f"Ajna SL set at reversal candle low {stop_loss:.4f} (2R TP = {take_profit_1:.4f}).")
+            else:
+                stop_loss = current - stop_distance
+                take_profit_1 = current + (stop_distance * 1.8)
+                take_profit_2 = current + (stop_distance * 3.0)
         elif (
             weighted_score <= short_threshold
             and technical_score <= (100 - min_technical)
@@ -247,9 +285,17 @@ class SignalEngine:
             side = SignalSide.SHORT
             entry_low = current * 0.997
             entry_high = current * 1.003
-            stop_loss = current + stop_distance
-            take_profit_1 = current - (stop_distance * 1.8)
-            take_profit_2 = current - (stop_distance * 3.0)
+            if smc_sl and smc_conf_block.get("type") == "short" and smc_sl > current:
+                # Use Ajna structure-based stop: reversal candle high * 1.001
+                stop_loss = smc_sl
+                stop_distance = stop_loss - current
+                take_profit_1 = current - stop_distance * 2.0   # 2R
+                take_profit_2 = current - stop_distance * 3.5
+                rationale.append(f"Ajna SL set at reversal candle high {stop_loss:.4f} (2R TP = {take_profit_1:.4f}).")
+            else:
+                stop_loss = current + stop_distance
+                take_profit_1 = current - (stop_distance * 1.8)
+                take_profit_2 = current - (stop_distance * 3.0)
         else:
             side = SignalSide.NEUTRAL
             entry_low = current * 0.998
@@ -258,6 +304,15 @@ class SignalEngine:
             take_profit_1 = current + (stop_distance * 0.8)
             take_profit_2 = current + (stop_distance * 1.2)
             rationale.insert(0, "Signal quality is mixed, so the engine is staying selective.")
+
+        # Append SMC context to rationale when relevant
+        if smc_trend != "ranging" and side != SignalSide.NEUTRAL:
+            if (smc_trend == "bullish" and side == SignalSide.LONG) or (smc_trend == "bearish" and side == SignalSide.SHORT):
+                rationale.append(f"SMC swing bias aligns with the signal ({smc_trend}).")
+            else:
+                rationale.append(f"⚠️ SMC swing bias ({smc_trend}) diverges from signal direction — treat with caution.")
+        if smc_confluences:
+            rationale.append(f"SMC zone confluence: {', '.join(smc_confluences[:3])}.")
 
         if side == SignalSide.SHORT:
             confidence = round(((100.0 - weighted_score) * 0.7) + (risk_score * 0.3))
@@ -375,7 +430,7 @@ class SignalEngine:
                         f"⚠️ Support at {round(nearest_sup_price, 4)} is only {sup_dist_pct:.1f}% below entry — tight floor for shorts."
                     )
 
-        scores = {name: round(score.score, 2) for name, score in analyses.items()}
+        scores = {name: round(s.score, 2) for name, s in analyses.items()}
         scores["candle_interval"] = candle_interval  # type: ignore[assignment]
         signal = Signal(
             ticker=snapshot.ticker,

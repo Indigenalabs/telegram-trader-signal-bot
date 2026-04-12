@@ -65,6 +65,7 @@ class PaperTrader:
             if data is None:
                 continue
             sig = score_signal(
+                opens=data.get("opens", data["closes"]),
                 closes=data["closes"],
                 highs=data["highs"],
                 lows=data["lows"],
@@ -72,8 +73,6 @@ class PaperTrader:
                 current_price=data["current_price"],
             )
             if sig["side"] is None:
-                continue
-            if sig["vol_ratio"] < self.cfg.MIN_VOLUME_RATIO:
                 continue
             if not is_tradeable_regime(ticker, self.cfg.REGIME_FILE, sig["side"]):
                 log.debug("%s regime blocks %s", ticker, sig["side"])
@@ -102,19 +101,24 @@ class PaperTrader:
         atr_val = sig["atr_val"]
         side = sig["side"]
 
-        if atr_val <= 0:
-            log.debug("%s atr=0, skipping", ticker)
-            return None
-
-        sl_dist = atr_val * self.cfg.STOP_LOSS_ATR_MULT
-        tp_dist = atr_val * self.cfg.TAKE_PROFIT_ATR_MULT
-
-        if side == "LONG":
-            stop_loss = price - sl_dist
-            take_profit = price + tp_dist
+        # Prefer Ajna structure-based SL/TP from confirmation block (2R)
+        conf_block = sig.get("conf_block")
+        if conf_block and sig.get("sl") and sig.get("tp"):
+            stop_loss = sig["sl"]
+            take_profit = sig["tp"]
         else:
-            stop_loss = price + sl_dist
-            take_profit = price - tp_dist
+            # Fall back to ATR-based stops
+            if atr_val <= 0:
+                log.debug("%s atr=0, skipping", ticker)
+                return None
+            sl_dist = atr_val * self.cfg.STOP_LOSS_ATR_MULT
+            tp_dist = atr_val * self.cfg.TAKE_PROFIT_ATR_MULT
+            if side == "LONG":
+                stop_loss = price - sl_dist
+                take_profit = price + tp_dist
+            else:
+                stop_loss = price + sl_dist
+                take_profit = price - tp_dist
 
         risk_per_unit = abs(price - stop_loss)
         if risk_per_unit <= 0:
@@ -126,6 +130,7 @@ class PaperTrader:
 
         regime = _safe_read_regime(ticker, self.cfg.REGIME_FILE)
 
+        conf_block = sig.get("conf_block") or {}
         trade_id = self.db.open_trade(
             ticker=ticker,
             side=side,
@@ -138,11 +143,9 @@ class PaperTrader:
             regime=regime,
             signal_score=sig["score"],
             metadata={
-                "ema9": sig.get("ema9"),
-                "ema21": sig.get("ema21"),
-                "rsi": sig.get("rsi"),
-                "vol_ratio": sig.get("vol_ratio"),
                 "vwap": sig.get("vwap_val"),
+                "conf_block_type": conf_block.get("rev_type"),
+                "conf_block_idx": conf_block.get("idx"),
                 "details": sig.get("details", []),
             },
         )

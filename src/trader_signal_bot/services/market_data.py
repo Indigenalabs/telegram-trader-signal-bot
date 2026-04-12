@@ -89,6 +89,7 @@ class BinanceMarketDataProvider(MarketDataProvider):
         )
         klines_response.raise_for_status()
         klines_payload = klines_response.json()
+        opens = [float(item[1]) for item in klines_payload]
         closes = [float(item[4]) for item in klines_payload]
         highs = [float(item[2]) for item in klines_payload]
         lows = [float(item[3]) for item in klines_payload]
@@ -119,6 +120,7 @@ class BinanceMarketDataProvider(MarketDataProvider):
             history_high=highs,
             history_low=lows,
             history_volume=volumes,
+            history_open=opens,
             meta={
                 "exchange": "Binance",
                 "market_cap": None,
@@ -172,6 +174,7 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
             raise ValueError(f"Insufficient Twelve Data history returned for {ticker}")
 
         ordered = list(reversed(values))
+        opens = [float(item["open"]) for item in ordered]
         closes = [float(item["close"]) for item in ordered]
         highs = [float(item["high"]) for item in ordered]
         lows = [float(item["low"]) for item in ordered]
@@ -193,6 +196,7 @@ class TwelveDataMarketDataProvider(MarketDataProvider):
             history_high=highs[-self.limit:],
             history_low=lows[-self.limit:],
             history_volume=volumes[-self.limit:],
+            history_open=opens[-self.limit:],
             meta={
                 "exchange": payload.get("meta", {}).get("exchange", "Twelve Data"),
                 "market_cap": None,
@@ -244,6 +248,7 @@ class YahooMarketDataProvider(MarketDataProvider):
             raise ValueError(f"No market data returned for {ticker}")
 
         quote_data = result["indicators"]["quote"][0]
+        opens = [float(value) for value in quote_data.get("open", []) if value is not None]
         closes = [float(value) for value in quote_data.get("close", []) if value is not None]
         highs = [float(value) for value in quote_data.get("high", []) if value is not None]
         lows = [float(value) for value in quote_data.get("low", []) if value is not None]
@@ -271,6 +276,7 @@ class YahooMarketDataProvider(MarketDataProvider):
             history_high=highs[-self.limit:],
             history_low=lows[-self.limit:],
             history_volume=volumes[-self.limit:],
+            history_open=opens[-self.limit:],
             meta={
                 "exchange": meta.get("exchangeName", "unknown"),
                 "market_cap": meta.get("marketCap"),

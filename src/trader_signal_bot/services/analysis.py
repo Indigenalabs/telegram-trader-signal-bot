@@ -602,6 +602,322 @@ def risk_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
     )
 
 
+# ── Smart Money Concepts (Ajna Strategy) ─────────────────────────────────────
+
+def _smc_detect_swing_points(
+    highs: list[float], lows: list[float], lookback: int = 5
+) -> dict[str, list[dict]]:
+    """Return swing highs and lows as {idx, price} dicts."""
+    swing_highs: list[dict] = []
+    swing_lows: list[dict] = []
+    n = len(highs)
+    for i in range(lookback, n - lookback):
+        is_high = all(highs[j] < highs[i] for j in range(i - lookback, i + lookback + 1) if j != i)
+        is_low = all(lows[j] > lows[i] for j in range(i - lookback, i + lookback + 1) if j != i)
+        if is_high:
+            swing_highs.append({"idx": i, "price": highs[i]})
+        if is_low:
+            swing_lows.append({"idx": i, "price": lows[i]})
+    return {"highs": swing_highs, "lows": swing_lows}
+
+
+def _smc_determine_trend(swings: dict[str, list[dict]]) -> str:
+    """Return 'bullish', 'bearish', or 'ranging' from recent swing structure."""
+    highs = swings["highs"]
+    lows = swings["lows"]
+    if len(highs) < 2 or len(lows) < 2:
+        return "ranging"
+    rh = highs[-3:]
+    rl = lows[-3:]
+    is_hh = rh[-1]["price"] > rh[0]["price"]
+    is_hl = rl[-1]["price"] > rl[0]["price"]
+    is_lh = rh[-1]["price"] < rh[0]["price"]
+    is_ll = rl[-1]["price"] < rl[0]["price"]
+    if is_hh and is_hl:
+        return "bullish"
+    if is_lh and is_ll:
+        return "bearish"
+    return "ranging"
+
+
+def _smc_detect_fvgs(
+    highs: list[float], lows: list[float]
+) -> list[dict]:
+    """Detect Fair Value Gaps (3-candle imbalance)."""
+    gaps: list[dict] = []
+    n = len(highs)
+    for i in range(2, n):
+        if highs[i - 2] < lows[i]:
+            gaps.append({"type": "bullish", "top": lows[i], "bottom": highs[i - 2], "idx": i - 1})
+        elif lows[i - 2] > highs[i]:
+            gaps.append({"type": "bearish", "top": lows[i - 2], "bottom": highs[i], "idx": i - 1})
+    return gaps[-10:]
+
+
+def _smc_detect_order_blocks(
+    opens: list[float], highs: list[float], lows: list[float], closes: list[float]
+) -> list[dict]:
+    """Detect Order Blocks — the last consolidation candle before a strong expansion."""
+    obs: list[dict] = []
+    n = len(closes)
+    for i in range(1, n - 1):
+        curr_body = abs(closes[i] - opens[i])
+        next_body = abs(closes[i + 1] - opens[i + 1])
+        next_range = highs[i + 1] - lows[i + 1]
+        if next_range > 0 and next_body / next_range > 0.6 and next_body > curr_body * 1.3:
+            ob_type = "bullish" if closes[i + 1] > opens[i + 1] else "bearish"
+            obs.append({"type": ob_type, "top": highs[i], "bottom": lows[i], "idx": i})
+    return obs[-8:]
+
+
+def _smc_detect_reversal_candles(
+    opens: list[float], highs: list[float], lows: list[float], closes: list[float]
+) -> list[dict]:
+    """
+    Detect hammer, shooting star, engulfing, and strong-body candles.
+    Returns list of {type, idx, dir, price} dicts.
+    """
+    result: list[dict] = []
+    n = len(closes)
+    for i in range(1, n):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        po, pc = opens[i - 1], closes[i - 1]
+        body = abs(c - o)
+        rng = h - l
+        if rng == 0:
+            continue
+        upper = h - max(o, c)
+        lower = min(o, c) - l
+
+        if lower >= body * 2 and upper <= body * 0.5 and body / rng > 0.1:
+            result.append({"type": "hammer", "idx": i, "dir": "bullish", "price": l})
+        elif upper >= body * 2 and lower <= body * 0.5 and body / rng > 0.1:
+            result.append({"type": "shooting_star", "idx": i, "dir": "bearish", "price": h})
+        elif pc < po and c > o and c > po and o < pc:
+            result.append({"type": "bullish_engulf", "idx": i, "dir": "bullish", "price": l})
+        elif pc > po and c < o and c < po and o > pc:
+            result.append({"type": "bearish_engulf", "idx": i, "dir": "bearish", "price": h})
+        elif body / rng > 0.6:
+            d = "bullish" if c > o else "bearish"
+            result.append({"type": "strong_body", "idx": i, "dir": d, "price": l if d == "bullish" else h})
+    return result[-12:]
+
+
+def _smc_detect_confirmation_blocks(
+    opens: list[float], highs: list[float], lows: list[float], closes: list[float],
+    volumes: list[float],
+) -> list[dict]:
+    """
+    Ajna's Confirmation Block: a reversal candle followed by a breakout candle
+    with volume >= 1.5x 20-period average.
+    Returns list of {type, entry, sl, tp, idx, rev_type} dicts.
+    """
+    if len(closes) < 22:
+        return []
+    reversals = _smc_detect_reversal_candles(opens, highs, lows, closes)
+    n = len(closes)
+    blocks: list[dict] = []
+    # Precompute fallback average volume
+    fallback_vol = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else (sum(volumes) / len(volumes) if volumes else 1.0)
+
+    for rev in reversals:
+        next_idx = rev["idx"] + 1
+        if next_idx >= n:
+            continue
+        prev_h = highs[rev["idx"]]
+        prev_l = lows[rev["idx"]]
+        curr_c = closes[next_idx]
+        curr_v = volumes[next_idx] if next_idx < len(volumes) else 0.0
+        # Volume threshold: 1.5x 20-period average ending at next_idx
+        start = max(0, next_idx - 20)
+        vol_slice = volumes[start:next_idx]
+        avg_vol = sum(vol_slice) / len(vol_slice) if vol_slice else fallback_vol
+        threshold = avg_vol * 1.5
+
+        if rev["dir"] == "bullish" and curr_c > prev_h and curr_v >= threshold:
+            entry = curr_c
+            sl = lows[rev["idx"]] * 0.999
+            tp = entry + (entry - sl) * 2.0
+            blocks.append({
+                "type": "long", "entry": entry, "sl": sl, "tp": tp,
+                "idx": next_idx, "rev_idx": rev["idx"], "rev_type": rev["type"],
+            })
+        elif rev["dir"] == "bearish" and curr_c < prev_l and curr_v >= threshold:
+            entry = curr_c
+            sl = highs[rev["idx"]] * 1.001
+            tp = entry - (sl - entry) * 2.0
+            blocks.append({
+                "type": "short", "entry": entry, "sl": sl, "tp": tp,
+                "idx": next_idx, "rev_idx": rev["idx"], "rev_type": rev["type"],
+            })
+    return blocks[-5:]
+
+
+def _smc_count_confluences(
+    price: float,
+    swings: dict[str, list[dict]],
+    fvgs: list[dict],
+    obs: list[dict],
+    vwap_val: float,
+) -> list[str]:
+    """Count SMC zones near the current price (within 0.5% band)."""
+    band = price * 0.005
+    hits: list[str] = []
+    for z in fvgs:
+        if z["bottom"] <= price + band and z["top"] >= price - band:
+            hits.append(f"FVG ({z['type']})")
+    for ob in obs:
+        if ob["bottom"] <= price + band and ob["top"] >= price - band:
+            hits.append(f"OB ({ob['type']})")
+    for h in swings["highs"][-8:]:
+        if abs(h["price"] - price) <= band:
+            hits.append("Swing High")
+    for lo in swings["lows"][-8:]:
+        if abs(lo["price"] - price) <= band:
+            hits.append("Swing Low")
+    if vwap_val and abs(vwap_val - price) <= band:
+        hits.append("VWAP")
+    return hits
+
+
+def smc_technical_analysis(snapshot: PriceSnapshot) -> AnalysisScore:
+    """
+    Ajna-style SMC technical analysis.
+    Primary signal: Confirmation Block (reversal candle + volume breakout).
+    Secondary: multi-timeframe bias from swing structure + FVG/OB confluence.
+    Returns an AnalysisScore with score 0-100 and SMC facts.
+    """
+    opens = snapshot.history_open
+    closes = snapshot.history
+    highs = snapshot.history_high
+    lows = snapshot.history_low
+    volumes = snapshot.history_volume
+
+    # Need at least 30 candles for meaningful SMC analysis
+    n = min(len(closes), len(highs), len(lows), len(opens) if opens else len(closes))
+    if n < 15 or not highs or not lows:
+        return AnalysisScore(
+            name="smc",
+            score=50.0,
+            rationale=["Insufficient candle history for SMC analysis."],
+            facts={"smc_trend": "unknown", "confirmation_block": None},
+        )
+
+    # Use real opens if available, fall back to shifted closes
+    if opens and len(opens) >= n:
+        o = opens[-n:]
+    else:
+        o = [closes[max(0, i - 1)] for i in range(len(closes) - n, len(closes))]
+
+    c = closes[-n:]
+    h = highs[-n:]
+    lo = lows[-n:]
+    v = volumes[-n:] if volumes and len(volumes) >= n else [1.0] * n
+
+    swings = _smc_detect_swing_points(h, lo)
+    trend = _smc_determine_trend(swings)
+    fvgs = _smc_detect_fvgs(h, lo)
+    obs = _smc_detect_order_blocks(o, h, lo, c)
+    conf_blocks = _smc_detect_confirmation_blocks(o, h, lo, c, v)
+    vwap_val = _vwap(c, h, lo, v) if v else 0.0
+    current_price = c[-1]
+    confluences = _smc_count_confluences(current_price, swings, fvgs, obs, vwap_val)
+
+    score = 50.0
+    rationale: list[str] = []
+
+    # Trend bias
+    if trend == "bullish":
+        score += 15
+        rationale.append("Swing structure is bullish (higher highs and higher lows).")
+    elif trend == "bearish":
+        score -= 15
+        rationale.append("Swing structure is bearish (lower highs and lower lows).")
+    else:
+        rationale.append("Market structure is ranging — no clear swing bias.")
+
+    # Confirmation block (primary entry trigger)
+    latest_block = conf_blocks[-1] if conf_blocks else None
+    if latest_block:
+        recency = n - latest_block["idx"]
+        if recency <= 3:  # Block formed within last 3 candles — fresh signal
+            if latest_block["type"] == "long":
+                score += 25
+                rationale.append(
+                    f"Confirmation Block LONG: {latest_block['rev_type']} reversal + volume breakout "
+                    f"(entry≈{latest_block['entry']:.4f}, SL≈{latest_block['sl']:.4f}, TP≈{latest_block['tp']:.4f})."
+                )
+            else:
+                score -= 25
+                rationale.append(
+                    f"Confirmation Block SHORT: {latest_block['rev_type']} reversal + volume breakout "
+                    f"(entry≈{latest_block['entry']:.4f}, SL≈{latest_block['sl']:.4f}, TP≈{latest_block['tp']:.4f})."
+                )
+        elif recency <= 8:  # Older block — still relevant but less urgent
+            if latest_block["type"] == "long":
+                score += 10
+            else:
+                score -= 10
+            rationale.append(f"Confirmation Block ({latest_block['type'].upper()}) from {recency} candles ago — structure still active.")
+    else:
+        rationale.append("No Confirmation Block detected — waiting for reversal + volume trigger.")
+
+    # FVG proximity
+    for fvg in fvgs[-3:]:
+        if fvg["bottom"] <= current_price <= fvg["top"]:
+            if fvg["type"] == "bullish":
+                score += 8
+                rationale.append(f"Price is inside a bullish FVG ({fvg['bottom']:.4f}–{fvg['top']:.4f}) — high-probability long zone.")
+            else:
+                score -= 8
+                rationale.append(f"Price is inside a bearish FVG ({fvg['bottom']:.4f}–{fvg['top']:.4f}) — high-probability short zone.")
+            break
+
+    # OB proximity
+    for ob in obs[-3:]:
+        if ob["bottom"] <= current_price <= ob["top"]:
+            if ob["type"] == "bullish":
+                score += 6
+                rationale.append(f"Price is at a bullish Order Block ({ob['bottom']:.4f}–{ob['top']:.4f}).")
+            else:
+                score -= 6
+                rationale.append(f"Price is at a bearish Order Block ({ob['bottom']:.4f}–{ob['top']:.4f}).")
+            break
+
+    # Confluence boost — each extra SMC zone adds confidence
+    if len(confluences) >= 3:
+        score += 8
+        rationale.append(f"Strong SMC confluence: {', '.join(confluences[:4])}.")
+    elif len(confluences) >= 2:
+        score += 4
+        rationale.append(f"SMC confluence ({len(confluences)} zones): {', '.join(confluences[:3])}.")
+
+    # VWAP location
+    if vwap_val > 0:
+        if current_price > vwap_val:
+            score += 5
+            rationale.append(f"Price is above VWAP ({vwap_val:.4f}) — intraday buyers in control.")
+        else:
+            score -= 5
+            rationale.append(f"Price is below VWAP ({vwap_val:.4f}) — intraday sellers in control.")
+
+    return AnalysisScore(
+        name="smc",
+        score=max(0.0, min(score, 100.0)),
+        rationale=rationale,
+        facts={
+            "smc_trend": trend,
+            "confirmation_block": latest_block,
+            "fvg_count": len(fvgs),
+            "ob_count": len(obs),
+            "confluences": confluences,
+            "vwap": round(vwap_val, 4),
+            "swing_highs": len(swings["highs"]),
+            "swing_lows": len(swings["lows"]),
+        },
+    )
+
+
 def portfolio_risk_summary(positions: list[PortfolioPosition]) -> tuple[str, list[str], float]:
     if not positions:
         return "low", ["No open positions tracked."], 0.0

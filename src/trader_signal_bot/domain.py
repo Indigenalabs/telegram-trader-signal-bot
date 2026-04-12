@@ -43,6 +43,7 @@ class PriceSnapshot:
     history_high: list[float] = field(default_factory=list)
     history_low: list[float] = field(default_factory=list)
     history_volume: list[float] = field(default_factory=list)
+    history_open: list[float] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
 
 
