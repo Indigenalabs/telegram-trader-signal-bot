@@ -392,12 +392,12 @@ def score_signal(
         score -= 4
         details.append(f"Weak volume {vr:.1f}x avg.")
 
-    # ── 5. Final gate: score >= 76 ──
-    if score >= 76:
+    # ── 5. Final gate: score >= 82 (requires 2+ confirming factors beyond the block) ──
+    if score >= 82:
         side = "LONG" if block_side == "long" else "SHORT"
     else:
         side = None
-        details.append(f"Score {score:.0f} < 76 threshold — no entry.")
+        details.append(f"Score {score:.0f} < 82 threshold — no entry.")
 
     return {
         "side": side,
