@@ -54,14 +54,14 @@ class Config:
     # Risk per trade as fraction of capital
     RISK_PER_TRADE: float = float(os.getenv("SCALPER_RISK_PER_TRADE", "0.01"))  # 1%
 
-    # Exit rules (scalp — tight and fast)
+    # Exit rules — SMC plays need room to develop
     TAKE_PROFIT_ATR_MULT: float = float(os.getenv("SCALPER_TP_ATR", "2.0"))
     STOP_LOSS_ATR_MULT: float = float(os.getenv("SCALPER_SL_ATR", "0.8"))
-    MAX_HOLD_MINUTES: int = int(os.getenv("SCALPER_MAX_HOLD_MINUTES", "30"))
+    MAX_HOLD_MINUTES: int = int(os.getenv("SCALPER_MAX_HOLD_MINUTES", "60"))  # was 30
 
-    # Signal filters
+    # Signal filters — tighter to reduce overtrading
     MIN_VOLUME_RATIO: float = float(os.getenv("SCALPER_MIN_VOL_RATIO", "1.2"))
-    MAX_CONCURRENT_TRADES: int = int(os.getenv("SCALPER_MAX_TRADES", "3"))
+    MAX_CONCURRENT_TRADES: int = int(os.getenv("SCALPER_MAX_TRADES", "2"))  # was 3
 
     # Scan interval
     SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCALPER_SCAN_INTERVAL", "60"))
