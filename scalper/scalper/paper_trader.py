@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -12,6 +13,7 @@ from .learning_bridge import record_scalper_closure
 from .market_data import fetch_ohlcv, fetch_price
 from .regime_reader import is_tradeable_regime
 from .signal_bridge import get_pending_signal_bot_trades, mark_acted
+from .ticker_scanner import get_top_tickers
 
 log = logging.getLogger(__name__)
 
@@ -55,37 +57,7 @@ class PaperTrader:
         slots = self.cfg.MAX_CONCURRENT_TRADES - len(open_trades)
         open_tickers = {t["ticker"] for t in open_trades}
 
-        for ticker in self.cfg.TICKERS:
-            if slots <= 0:
-                break
-            if ticker in open_tickers:
-                continue
-            data = fetch_ohlcv(
-                ticker,
-                interval=self.cfg.CANDLE_INTERVAL,
-                limit=self.cfg.CANDLE_LIMIT,
-                api_key=self.cfg.BINANCE_API_KEY,
-            )
-            if data is None:
-                continue
-            sig = score_signal(
-                opens=data.get("opens", data["closes"]),
-                closes=data["closes"],
-                highs=data["highs"],
-                lows=data["lows"],
-                volumes=data["volumes"],
-                current_price=data["current_price"],
-            )
-            if sig["side"] is None:
-                continue
-            if not is_tradeable_regime(ticker, self.cfg.REGIME_FILE, sig["side"]):
-                log.debug("%s regime blocks %s", ticker, sig["side"])
-                continue
-
-            trade_id = self._open_trade(ticker, data["current_price"], sig)
-            if trade_id:
-                slots -= 1
-                open_tickers.add(ticker)
+        self._scan_and_trade(slots, open_tickers)
 
     def run_forever(self) -> None:
         """Blocking loop — call from main thread."""
@@ -100,6 +72,83 @@ class PaperTrader:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _scan_and_trade(self, slots: int, open_tickers: set[str]) -> None:
+        """
+        Fetch the dynamic ticker universe, score all tickers in parallel,
+        rank by score, and open trades on the top setups.
+
+        Falls back to config TICKERS if the dynamic scanner returns nothing.
+        """
+        universe = get_top_tickers(
+            api_key=self.cfg.BINANCE_API_KEY,
+            min_volume_usdt=self.cfg.UNIVERSE_MIN_VOLUME_USDT,
+            max_tickers=self.cfg.UNIVERSE_MAX_TICKERS,
+        )
+        # Fallback to hardcoded list if Binance API unreachable
+        if not universe:
+            universe = self.cfg.TICKERS
+
+        candidates = [t for t in universe if t not in open_tickers]
+        if not candidates:
+            return
+
+        def _fetch_score(ticker: str) -> tuple[str, dict, dict] | None:
+            data = fetch_ohlcv(
+                ticker,
+                interval=self.cfg.CANDLE_INTERVAL,
+                limit=self.cfg.CANDLE_LIMIT,
+                api_key=self.cfg.BINANCE_API_KEY,
+            )
+            if data is None:
+                return None
+            sig = score_signal(
+                opens=data.get("opens", data["closes"]),
+                closes=data["closes"],
+                highs=data["highs"],
+                lows=data["lows"],
+                volumes=data["volumes"],
+                current_price=data["current_price"],
+            )
+            if sig["side"] is None:
+                return None
+            return ticker, data, sig
+
+        # Parallel fetch — 10 workers keeps total time under ~10s for 50 tickers
+        scored: list[tuple[str, dict, dict]] = []
+        with ThreadPoolExecutor(max_workers=self.cfg.SCAN_WORKERS) as pool:
+            futures = {pool.submit(_fetch_score, t): t for t in candidates}
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        scored.append(result)
+                except Exception as exc:
+                    log.debug("scan worker error: %s", exc)
+
+        if not scored:
+            return
+
+        # Rank by score descending — best setup gets first slot
+        scored.sort(key=lambda x: x[2]["score"], reverse=True)
+        log.info(
+            "Universe scan: %d/%d tickers with signals | top: %s %.0f",
+            len(scored), len(candidates),
+            scored[0][0], scored[0][2]["score"],
+        )
+
+        for ticker, data, sig in scored:
+            if slots <= 0:
+                break
+            if ticker in open_tickers:
+                continue
+            if not is_tradeable_regime(ticker, self.cfg.REGIME_FILE, sig["side"]):
+                log.debug("%s regime blocks %s", ticker, sig["side"])
+                continue
+            trade_id = self._open_trade(ticker, data["current_price"], sig)
+            if trade_id:
+                slots -= 1
+                open_tickers.add(ticker)
 
     def _mirror_signal_bot_trades(self) -> None:
         """

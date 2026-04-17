@@ -44,13 +44,20 @@ class Config:
     # Regime file written by the signal bot hourly
     REGIME_FILE: str = os.getenv("REGIME_FILE", "/opt/telegram-trader-signal-bot/data/market_regime.json")
 
-    # Trading universe — top crypto only (5m scalps, 24/7)
+    # Fallback ticker list — used only if Binance dynamic scanner fails
     TICKERS: list[str] = [
         t.strip() for t in os.getenv(
             "SCALPER_TICKERS",
             "BTC-USD,ETH-USD,SOL-USD,BNB-USD,XRP-USD"
         ).split(",") if t.strip()
     ]
+
+    # Dynamic universe settings — top crypto by 24h USDT volume
+    UNIVERSE_MAX_TICKERS: int = int(os.getenv("UNIVERSE_MAX_TICKERS", "50"))
+    UNIVERSE_MIN_VOLUME_USDT: float = float(os.getenv("UNIVERSE_MIN_VOLUME_USDT", "10000000"))
+
+    # Parallel scan workers — 10 keeps scan time under ~10s for 50 tickers
+    SCAN_WORKERS: int = int(os.getenv("SCAN_WORKERS", "10"))
 
     # Candle settings
     CANDLE_INTERVAL: str = "5m"
