@@ -82,6 +82,13 @@ class Config:
     # Scan interval
     SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCALPER_SCAN_INTERVAL", "60"))
 
+    # Circuit breaker — halts new entries when drawdown thresholds are hit
+    CB_MAX_CONSECUTIVE_LOSSES: int = int(os.getenv("CB_MAX_CONSECUTIVE_LOSSES", "3"))
+    CB_MAX_DAILY_DRAWDOWN_PCT: float = float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "3.0"))
+
+    # Stock paper trading — uses Yahoo Finance, only active during US market hours
+    STOCK_TRADING_ENABLED: bool = os.getenv("STOCK_TRADING_ENABLED", "true").lower() in {"1", "true", "yes"}
+
     # Daily report time (UTC hour)
     REPORT_HOUR_UTC: int = int(os.getenv("SCALPER_REPORT_HOUR_UTC", "8"))
 

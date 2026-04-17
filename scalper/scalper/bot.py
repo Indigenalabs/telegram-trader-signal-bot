@@ -44,6 +44,14 @@ class ScalperBot:
 
     def _on_closed(self, trade: dict) -> None:
         self.notifier.trade_closed(trade)
+        # Alert if circuit breaker just tripped on this close
+        cb_reason = trade.get("circuit_breaker")
+        if cb_reason:
+            self.notifier.send(
+                f"🔴 <b>Circuit Breaker Tripped</b>\n"
+                f"Reason: {cb_reason}\n"
+                f"New entries paused until midnight UTC or on next winning trade."
+            )
 
     def _maybe_daily_report(self) -> None:
         now = datetime.now(timezone.utc)

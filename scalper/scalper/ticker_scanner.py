@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -104,3 +105,45 @@ def get_top_tickers(
         )
 
     return _cache
+
+
+# ── US Stock Universe ─────────────────────────────────────────────────────────
+
+# Top liquid US stocks + ETFs — active movers with enough intraday volume
+# for Ajna confirmation blocks to be meaningful
+_TOP_STOCKS: list[str] = [
+    # Mega-cap tech
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
+    # High-beta / momentum names
+    "AMD", "PLTR", "MSTR", "COIN", "HOOD", "SOFI", "RBLX",
+    # Financials
+    "JPM", "BAC", "GS", "MS",
+    # Broad market ETFs (always liquid)
+    "SPY", "QQQ", "IWM",
+    # Sector ETFs
+    "XLK", "ARKK", "SOXS", "SOXL",
+]
+
+_stocks_cache: list[str] = _TOP_STOCKS.copy()
+
+
+def is_us_market_open() -> bool:
+    """
+    Returns True during US regular session: 9:30am–4:00pm ET, Monday–Friday.
+    Uses UTC time — ET is UTC-4 (EDT) or UTC-5 (EST).
+    Approximates with UTC-4 (EDT, valid Mar–Nov which covers most active months).
+    """
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    # Convert to approximate ET (UTC-4 EDT)
+    et_hour = (now_utc.hour - 4) % 24
+    et_minute = now_utc.minute
+    minutes_since_midnight = et_hour * 60 + et_minute
+    # 9:30am ET = 570 min, 4:00pm ET = 960 min
+    return 570 <= minutes_since_midnight < 960
+
+
+def get_top_stocks() -> list[str]:
+    """Return the stock universe. Market hours check is separate (use is_us_market_open)."""
+    return _stocks_cache

@@ -6,14 +6,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Callable
 
+from .circuit_breaker import CircuitBreaker
 from .config import Config
 from .database import Database
 from .indicators import score_signal
 from .learning_bridge import record_scalper_closure
-from .market_data import fetch_ohlcv, fetch_price
+from .market_data import fetch_ohlcv, fetch_ohlcv_yahoo, fetch_price, is_crypto_ticker
 from .regime_reader import is_tradeable_regime
 from .signal_bridge import get_pending_signal_bot_trades, mark_acted
-from .ticker_scanner import get_top_tickers
+from .ticker_scanner import get_top_stocks, get_top_tickers, is_us_market_open
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,10 @@ class PaperTrader:
         self.cfg = cfg
         self.on_trade_opened = on_trade_opened
         self.on_trade_closed = on_trade_closed
+        self.circuit_breaker = CircuitBreaker(
+            max_consecutive_losses=self.cfg.CB_MAX_CONSECUTIVE_LOSSES,
+            max_daily_drawdown_pct=self.cfg.CB_MAX_DAILY_DRAWDOWN_PCT,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -48,6 +53,14 @@ class PaperTrader:
     def run_once(self) -> None:
         """Execute one full scan-and-monitor cycle."""
         self._monitor_open_trades()
+
+        # Circuit breaker — skip new entries if drawdown threshold hit
+        capital = self._estimate_capital()
+        tripped, reason = self.circuit_breaker.check(capital)
+        if tripped:
+            log.info("Circuit breaker active (%s) — skipping new entries.", reason)
+            return
+
         # Mirror any new signal bot crypto signals first (higher quality — 85% WR)
         self._mirror_signal_bot_trades()
 
@@ -57,7 +70,16 @@ class PaperTrader:
         slots = self.cfg.MAX_CONCURRENT_TRADES - len(open_trades)
         open_tickers = {t["ticker"] for t in open_trades}
 
-        self._scan_and_trade(slots, open_tickers)
+        # Scan crypto universe (24/7)
+        self._scan_and_trade(slots, open_tickers, asset="crypto")
+
+        # Scan stocks during US market hours
+        if self.cfg.STOCK_TRADING_ENABLED and is_us_market_open():
+            open_trades = self.db.get_open_trades()
+            slots = self.cfg.MAX_CONCURRENT_TRADES - len(open_trades)
+            open_tickers = {t["ticker"] for t in open_trades}
+            if slots > 0:
+                self._scan_and_trade(slots, open_tickers, asset="stocks")
 
     def run_forever(self) -> None:
         """Blocking loop — call from main thread."""
@@ -73,33 +95,39 @@ class PaperTrader:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _scan_and_trade(self, slots: int, open_tickers: set[str]) -> None:
+    def _scan_and_trade(self, slots: int, open_tickers: set[str], asset: str = "crypto") -> None:
         """
-        Fetch the dynamic ticker universe, score all tickers in parallel,
-        rank by score, and open trades on the top setups.
-
+        Parallel-scan a ticker universe, rank by score, open the best setups.
+        asset: "crypto" (Binance, 24/7) or "stocks" (Yahoo Finance, market hours).
         Falls back to config TICKERS if the dynamic scanner returns nothing.
         """
-        universe = get_top_tickers(
-            api_key=self.cfg.BINANCE_API_KEY,
-            min_volume_usdt=self.cfg.UNIVERSE_MIN_VOLUME_USDT,
-            max_tickers=self.cfg.UNIVERSE_MAX_TICKERS,
-        )
-        # Fallback to hardcoded list if Binance API unreachable
-        if not universe:
-            universe = self.cfg.TICKERS
+        if asset == "stocks":
+            universe = get_top_stocks()
+        else:
+            universe = get_top_tickers(
+                api_key=self.cfg.BINANCE_API_KEY,
+                min_volume_usdt=self.cfg.UNIVERSE_MIN_VOLUME_USDT,
+                max_tickers=self.cfg.UNIVERSE_MAX_TICKERS,
+            ) or self.cfg.TICKERS
 
         candidates = [t for t in universe if t not in open_tickers]
         if not candidates:
             return
 
         def _fetch_score(ticker: str) -> tuple[str, dict, dict] | None:
-            data = fetch_ohlcv(
-                ticker,
-                interval=self.cfg.CANDLE_INTERVAL,
-                limit=self.cfg.CANDLE_LIMIT,
-                api_key=self.cfg.BINANCE_API_KEY,
-            )
+            if asset == "stocks":
+                data = fetch_ohlcv_yahoo(
+                    ticker,
+                    interval=self.cfg.CANDLE_INTERVAL,
+                    limit=self.cfg.CANDLE_LIMIT,
+                )
+            else:
+                data = fetch_ohlcv(
+                    ticker,
+                    interval=self.cfg.CANDLE_INTERVAL,
+                    limit=self.cfg.CANDLE_LIMIT,
+                    api_key=self.cfg.BINANCE_API_KEY,
+                )
             if data is None:
                 return None
             sig = score_signal(
@@ -114,7 +142,6 @@ class PaperTrader:
                 return None
             return ticker, data, sig
 
-        # Parallel fetch — 10 workers keeps total time under ~10s for 50 tickers
         scored: list[tuple[str, dict, dict]] = []
         with ThreadPoolExecutor(max_workers=self.cfg.SCAN_WORKERS) as pool:
             futures = {pool.submit(_fetch_score, t): t for t in candidates}
@@ -124,16 +151,15 @@ class PaperTrader:
                     if result:
                         scored.append(result)
                 except Exception as exc:
-                    log.debug("scan worker error: %s", exc)
+                    log.debug("scan worker error (%s): %s", asset, exc)
 
         if not scored:
             return
 
-        # Rank by score descending — best setup gets first slot
         scored.sort(key=lambda x: x[2]["score"], reverse=True)
         log.info(
-            "Universe scan: %d/%d tickers with signals | top: %s %.0f",
-            len(scored), len(candidates),
+            "%s scan: %d/%d signals | top: %s %.0f",
+            asset, len(scored), len(candidates),
             scored[0][0], scored[0][2]["score"],
         )
 
@@ -142,7 +168,7 @@ class PaperTrader:
                 break
             if ticker in open_tickers:
                 continue
-            if not is_tradeable_regime(ticker, self.cfg.REGIME_FILE, sig["side"]):
+            if asset == "crypto" and not is_tradeable_regime(ticker, self.cfg.REGIME_FILE, sig["side"]):
                 log.debug("%s regime blocks %s", ticker, sig["side"])
                 continue
             trade_id = self._open_trade(ticker, data["current_price"], sig)
@@ -357,6 +383,14 @@ class PaperTrader:
                         result["side"], result["ticker"], price,
                         exit_reason, result["pnl"], result["r_multiple"],
                     )
+                    # Update circuit breaker with outcome
+                    self.circuit_breaker.record_trade_result(win=result["win"])
+                    cb_tripped, cb_reason = self.circuit_breaker.check(self._estimate_capital())
+                    if cb_tripped:
+                        log.warning("CIRCUIT BREAKER TRIPPED after close: %s", cb_reason)
+                        if self.on_trade_closed:
+                            # Piggyback the CB alert onto the close notification
+                            result["circuit_breaker"] = cb_reason
                     # Feed outcome back into signal bot's learning model
                     record_scalper_closure(
                         signal_bot_data_dir=self.cfg.SIGNAL_BOT_DATA_DIR,
