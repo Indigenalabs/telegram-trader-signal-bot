@@ -11,6 +11,7 @@ from .indicators import score_signal
 from .learning_bridge import record_scalper_closure
 from .market_data import fetch_ohlcv, fetch_price
 from .regime_reader import is_tradeable_regime
+from .signal_bridge import get_pending_signal_bot_trades, mark_acted
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,9 @@ class PaperTrader:
     def run_once(self) -> None:
         """Execute one full scan-and-monitor cycle."""
         self._monitor_open_trades()
+        # Mirror any new signal bot crypto signals first (higher quality — 85% WR)
+        self._mirror_signal_bot_trades()
+
         open_trades = self.db.get_open_trades()
         if len(open_trades) >= self.cfg.MAX_CONCURRENT_TRADES:
             return
@@ -96,6 +100,93 @@ class PaperTrader:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _mirror_signal_bot_trades(self) -> None:
+        """
+        Open paper positions for any SIGNAL-stage crypto trades from the signal bot
+        that haven't been acted on yet. Signal bot runs at 85% WR — these are
+        high-quality setups we want to capture in addition to the scalper's own plays.
+        """
+        pending = get_pending_signal_bot_trades(
+            bot_state_db=self.cfg.SIGNAL_BOT_STATE_DB,
+            acted_file=self.cfg.SIGNAL_BOT_ACTED_FILE,
+        )
+        if not pending:
+            return
+
+        open_trades = self.db.get_open_trades()
+        open_tickers = {t["ticker"] for t in open_trades}
+
+        for sig in pending:
+            trade_id = sig["trade_id"]
+            ticker = sig["ticker"]
+            side = sig["side"]
+            entry = float(sig["entry"])
+            sl = float(sig["stop_loss"])
+            tp = float(sig["take_profit"])
+
+            # Always mark acted — even if we skip — so we don't re-check every scan
+            mark_acted(self.cfg.SIGNAL_BOT_ACTED_FILE, trade_id)
+
+            # Skip if at capacity or already in this ticker
+            if len(open_trades) >= self.cfg.MAX_CONCURRENT_TRADES:
+                break
+            if ticker in open_tickers:
+                continue
+
+            # Validate levels are geometrically sound
+            if side == "LONG" and not (sl < entry < tp):
+                log.debug("signal_bridge: %s LONG levels invalid — skip", ticker)
+                continue
+            if side == "SHORT" and not (tp < entry < sl):
+                log.debug("signal_bridge: %s SHORT levels invalid — skip", ticker)
+                continue
+
+            risk_per_unit = abs(entry - sl)
+            if risk_per_unit <= 0:
+                continue
+
+            capital = self._estimate_capital()
+            risk_amount = capital * self.cfg.RISK_PER_TRADE
+            position_size = risk_amount / risk_per_unit
+            regime = _safe_read_regime(ticker, self.cfg.REGIME_FILE)
+
+            db_trade_id = self.db.open_trade(
+                ticker=ticker,
+                side=side,
+                entry_price=entry,
+                position_size=position_size,
+                risk_amount=risk_amount,
+                stop_loss=sl,
+                take_profit=tp,
+                atr=0.0,
+                regime=regime,
+                signal_score=float(sig["confidence"]),
+                metadata={
+                    "source": "signal_bot",
+                    "signal_trade_id": trade_id,
+                    "signal_quality": sig.get("signal_quality", ""),
+                },
+            )
+            open_tickers.add(ticker)
+            # Rebuild open_trades count for the capacity check
+            open_trades = self.db.get_open_trades()
+
+            log.info(
+                "SIGNAL-BOT MIRROR %s %s @ %.4f  SL=%.4f TP=%.4f  confidence=%s",
+                side, ticker, entry, sl, tp, sig["confidence"],
+            )
+            if self.on_trade_opened:
+                self.on_trade_opened({
+                    "trade_id": db_trade_id,
+                    "ticker": ticker,
+                    "side": side,
+                    "entry": entry,
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "score": float(sig["confidence"]),
+                    "details": [f"Mirrored from signal bot ({sig.get('signal_quality', '')})"],
+                })
 
     def _open_trade(self, ticker: str, price: float, sig: dict) -> int | None:
         atr_val = sig["atr_val"]

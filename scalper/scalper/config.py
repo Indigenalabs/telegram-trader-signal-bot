@@ -32,6 +32,15 @@ class Config:
     # Signal bot data directory — scalper writes outcomes here so both bots share learning
     SIGNAL_BOT_DATA_DIR: str = os.getenv("SIGNAL_BOT_DATA_DIR", "/opt/telegram-trader-signal-bot/data")
 
+    # Signal bot SQLite state DB — scalper reads active signals from here
+    SIGNAL_BOT_STATE_DB: str = os.getenv(
+        "SIGNAL_BOT_STATE_DB",
+        "/opt/telegram-trader-signal-bot/data/bot_state.db",
+    )
+
+    # Tracks which signal bot trade_ids the scalper has already acted on
+    SIGNAL_BOT_ACTED_FILE: str = os.getenv("SIGNAL_BOT_ACTED_FILE", "data/signal_bot_acted.json")
+
     # Regime file written by the signal bot hourly
     REGIME_FILE: str = os.getenv("REGIME_FILE", "/opt/telegram-trader-signal-bot/data/market_regime.json")
 
